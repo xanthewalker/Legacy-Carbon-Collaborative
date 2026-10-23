@@ -1,0 +1,679 @@
+---
+title: "Legacy Carbon Collaborative — Build site-level input file"
+author: "Xanthe Walker"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+
+knitr::opts_knit$set(root.dir = "C:/Users/xjw5/OneDrive - Northern Arizona University/NAU/Alaska - Leg C/Data/Legacy Carbon Collaborative")
+setwd("C:/Users/xjw5/OneDrive - Northern Arizona University/NAU/Alaska - Leg C/Data/Legacy Carbon Collaborative")
+rm(list = ls())
+
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflicts_prefer(dplyr::lag)
+```
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(forcats)
+library(purrr)
+library(patchwork)
+library(reshape2)
+library(SoilR)
+library(Bchron)
+library(rcarbon)
+library(lme4)
+library(MuMIn)
+library(performance)
+library(glmmTMB)
+library(DHARMa)
+library(glue)
+```
+
+---
+
+# 1  Shared helpers
+
+```{r helpers}
+# Safe left_join: warns if RHS has duplicate keys
+safe_left_join <- function(x, y, by) {
+  dups <- y %>% count(across(all_of(by))) %>% filter(n > 1)
+  if (nrow(dups) > 0)
+    message("WARNING: duplicate RHS keys for join on: ", paste(by, collapse = ", "))
+  left_join(x, y, by = by)
+}
+
+# Safe division (returns NA instead of Inf / NaN)
+safe_div <- function(num, den) {
+  ifelse(is.finite(num) & is.finite(den) & den != 0, num / den, NA_real_)
+}
+
+# Shared ggplot theme used throughout
+theme_lcc <- function(...) {
+  theme_bw() +
+    theme(
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = 12),
+      axis.text.y  = element_text(size = 12),
+      axis.title.y = element_text(size = 14, vjust = 2),
+      legend.position = "top",
+      legend.title = element_blank(),
+      legend.text  = element_text(size = 12),
+      strip.text   = element_text(face = "bold", size = 14),
+      ...
+    )
+}
+
+# StudyArea display order
+STUDY_AREA_LEVELS <- c("AK tundra", "AK boreal", "AK maritime",
+                       "Yukon", "NWT", "Quebec", "NL", "Sweden")
+```
+
+---
+
+# 2  Build atmosphere / bomb-curve reference
+
+```{r atmosphere}
+bomb_curve <- as.data.frame(Hua2021$NHZone2[, 1:2]) %>%
+  rename(year = Year, D14C = mean.Delta14C) %>%
+  mutate(year = as.numeric(year))
+
+d14c_extra <- read_csv("D14C_age_new.csv",
+                       show_col_types = FALSE) %>%
+  mutate(year = as.numeric(year))
+
+f_subset <- bind_rows(d14c_extra, bomb_curve) %>%
+  filter(!is.na(year)) %>%
+  group_by(year_floor = floor(year)) %>%
+  slice_min(abs(year - year_floor), with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(year = year_floor, D14C)
+
+stopifnot(!anyDuplicated(f_subset$year))
+
+f_subset_x14c <- rename(f_subset, X14C = D14C)
+```
+
+---
+
+# 3  Site data
+
+## 3.1  Alaska / Walker plots
+
+```{r site-alaska}
+aa <- read_csv("PLOT_03172025_final.csv", show_col_types = FALSE)
+
+alaska_raw <- aa %>%
+  mutate(
+    StdAge = as.integer(round(StdAge, 0)),
+    year2  = recent_burn - StdAge,
+    year   = if_else(year2 > 1900, year2, round(year2 / 5) * 5)
+  )
+
+site_alaska <- alaska_raw %>%
+  select(fire, site, plot, year,
+         latitude, longitude, elevation, slope, aspect, moisture_class,
+         recent_burn, reburn_class_7, ForestType,
+         burn_depth, residualSOL_depth, StdAge,
+         residualSOL.C, SOL.C.Combusted, prefireSOL.C) %>%
+  safe_left_join(f_subset, by = "year") %>%
+  rename(
+    stand_age14C   = D14C,
+    stand_age      = StdAge,
+    Moisture_Class = moisture_class,
+    Elevation      = elevation,
+    Slope          = slope,
+    Aspect         = aspect,
+    Year_of_Burn   = recent_burn,
+    Latitude       = latitude,
+    Longitude      = longitude
+  ) %>%
+  mutate(
+    StudyArea          = "Alaska",
+    Researcher         = "Walker",
+    siteplot           = paste(site, plot, sep = "_"),
+    project            = "LC",
+    reburn_class_final = reburn_class_7
+  )
+site_alaska <- site_alaska %>%
+  mutate(site = as.character(site))
+```
+
+## 3.2  LCC + NWT sites
+
+```{r site-lcc-nwt}
+coerce_site_numerics <- function(df) {
+  df %>% mutate(across(
+    c(Aspect, Year_of_Burn, Stand_age, Latitude, Longitude, Elevation, Slope),
+    ~ suppressWarnings(as.numeric(.))
+  ))
+}
+
+LCC <- read_csv("LCC_Site_Data_PLEASE CHECK_08_26_2025.csv",
+                show_col_types = FALSE) %>%
+  mutate(project = "LCC") %>%
+  coerce_site_numerics()
+
+NWT <- read_csv("NWT_Site_Data_Walker.csv", show_col_types = FALSE) %>%
+  mutate(
+    project = "NWT",
+    Coordinate_Reference_System..projection.or.EPSG. = NA_character_,
+    Sampling_Date = as.character(Sampling_Date)
+  ) %>%
+  coerce_site_numerics()
+
+LCC_combined <- bind_rows(LCC, NWT) %>%
+  mutate(across(where(is.character), ~ na_if(., ""))) %>%
+  rename(ForestType = Dom_Tree) %>%
+  mutate(
+    Stand_age    = suppressWarnings(as.numeric(Stand_age)),
+    Year_of_Burn = suppressWarnings(as.numeric(Year_of_Burn)),
+    stand_age_imputed = case_when(
+      is.na(Stand_age) & StudyArea == "AK tundra" ~ "imputed_250",
+      is.na(Stand_age)                             ~ "imputed_100",
+      TRUE                                         ~ NA_character_
+    ),
+    Stand_age_new = case_when(
+      is.na(Stand_age) & StudyArea == "AK tundra" ~ 250,
+      is.na(Stand_age)                             ~ 100,
+      TRUE                                         ~ Stand_age
+    )
+  )
+
+EXCLUDE_SITES <- c(
+  "SM 31-2 Unburned", "NP 19-2 Unburned",
+  "WF-LCC-1", "WF-LCC-2", "WF-LCC-3", "WF-LCC-4",
+  "SM 44-2 Unburned"
+)
+
+LCC_combined <- LCC_combined %>%
+  mutate(
+    year_raw = if_else(
+      !(site %in% EXCLUDE_SITES),
+      Year_of_Burn - Stand_age_new,
+      Year_of_Burn
+    ),
+    year = if_else(year_raw < 1901, round(year_raw / 5) * 5, year_raw)
+  )
+
+site_lcc <- LCC_combined %>%
+  safe_left_join(f_subset, by = "year") %>%
+  rename(
+    stand_age14C      = D14C,
+    stand_age         = Stand_age_new,
+    siteplot          = site,
+    burn_depth        = Burn_Depth,
+    residualSOL_depth = SOL_depth
+  ) %>%
+  mutate(
+    fire            = NA_character_,
+    site            = NA_character_,
+    plot            = NA_character_,
+    residualSOL.C   = NA_real_,
+    SOL.C.Combusted = NA_real_,
+    prefireSOL.C    = NA_real_,
+    across(c(Latitude, Longitude, Elevation, Slope, Aspect,
+             residualSOL_depth, burn_depth),
+           ~ suppressWarnings(as.numeric(.)))
+  )
+```
+
+## 3.3  Merge all sites
+
+```{r site-merge}
+CHAR_COLS <- c("site", "plot", "fire", "Researcher", "StudyArea", "project",
+               "reburn_class_final", "Moisture_Class", "ForestType", "siteplot")
+
+all.site <- bind_rows(
+  site_lcc   %>% mutate(across(all_of(intersect(names(.), CHAR_COLS)), as.character)),
+  site_alaska %>% mutate(across(all_of(intersect(names(.), CHAR_COLS)), as.character))
+) %>%
+  mutate(
+    Researcher = if_else(Researcher == "Walker" & StudyArea == "NWT",
+                         "Walker/Mack", Researcher),
+    fire = if_else(
+      Researcher == "Walker/Mack",
+      str_extract(siteplot, "^[^-]+"),
+      fire
+    )
+  )
+
+all.site2 <- all.site %>%
+  mutate(
+    Researcher = case_when(
+      str_detect(Researcher, "Dominique Arseneault") ~ "Arseneault",
+      str_detect(Researcher, "Lucas Brehaut")        ~ "Brehaut",
+      str_detect(Researcher, "Gundale/Nilsson")       ~ "Gundale",
+      str_detect(Researcher, "Kirsten Reid")          ~ "Brown",
+      str_detect(Researcher, "Hung") | str_detect(Researcher, "Natali") ~ "Hung-Natali",
+      TRUE ~ Researcher
+    ),
+    StudyArea = if_else(StudyArea %in% c("Western Quebec", "Eastern Quebec"),
+                        "Quebec", StudyArea),
+    # ── Canonical moisture class names (submesic replaces mesic-subxeric) ───────
+    Moisture_Class = case_when(
+      Moisture_Class %in% c("Subhydric", "Subhydric ", "6") ~ "subhygric",
+      Moisture_Class %in% c("1", "Xeric")                   ~ "xeric",
+      Moisture_Class == "2"                                  ~ "subxeric",
+      Moisture_Class == "3"                                  ~ "submesic",
+      Moisture_Class == "4"                                  ~ "mesic",
+      Moisture_Class == "5"                                  ~ "mesic-subhygric",
+      TRUE ~ Moisture_Class
+    ),
+    site = if_else(is.na(site) & !is.na(siteplot), siteplot, site)
+  )
+
+write_csv(all.site2, "LCC_allsites_05162026.csv")
+```
+
+---
+
+# 4  Radiocarbon data
+
+## 4.1  Load & clean long-format radiocarbon file
+
+```{r rc-load}
+radio <- read_csv("LCC_14C_long_clean_08262025.csv", show_col_types = FALSE) %>%
+  rename(
+    new.depth    = `new depth`,
+    new.X14C     = `new X14C`,
+    new.X14C.err = `new X14C.err`,
+    new.F14C     = `new F14C`,
+    new.F14C.err = `new F14C.err`
+  ) %>%
+  mutate(
+    depth      = coalesce(`new.depth`,    depth),
+    X14C       = coalesce(`new.X14C`,     X14C),
+    X14C.err   = coalesce(`new.X14C.err`, X14C.err),
+    F14C       = coalesce(`new.F14C`,     F14C),
+    F14C.err   = coalesce(`new.F14C.err`, F14C.err)
+  ) %>%
+  select(-starts_with("new.")) %>%
+  mutate(
+    Researcher = if_else(Researcher == "Pare", "Pare-Laganiere", Researcher),
+    across(c(site, plot, siteplot), as.character)
+  )
+
+# Sample relabels: measured values moved to a different position in the core
+# where they are out of depth order in a way consistent with a labelling
+# mix-up. NOT verified against lab or field records. Affected profiles are
+# flagged (samples_relabeled = TRUE in the archive) so they can be excluded
+# or tested in sensitivity analysis. The original label stays in `section`.
+SAMPLE_RELABELS <- tribble(
+  ~ID,       ~new_section, ~new_depth, ~relabel_reason,
+  # MID <-> BOTTOM
+  "LCC_170", "BOTTOM",      9,  "MID/BOTTOM swap (unverified)",   # Lab-03
+  "LCC_171", "MID",         2,  "MID/BOTTOM swap (unverified)",
+  "LCC_280", "BOTTOM",     28,  "MID/BOTTOM swap (unverified)",   # TUN10 23AP40B1
+  "LCC_281", "MID",         2,  "MID/BOTTOM swap (unverified)",
+  "LC_222",  "BOTTOM",      3,  "MID/BOTTOM swap (unverified)",   # LC_188C
+  "LC_223",  "MID",         2,  "MID/BOTTOM swap (unverified)",
+  "RC138",   "BOTTOM",      3,  "MID/BOTTOM swap (unverified)",   # ZF20-10A_12
+  "RC139",   "MID",         2,  "MID/BOTTOM swap (unverified)",
+  # TOP <-> BOTTOM (core reversed)
+  "LCC_233", "BOTTOM",     20,  "TOP/BOTTOM swap (unverified)",   # Sample 5
+  "LCC_235", "TOP",         1,  "TOP/BOTTOM swap (unverified)"
+  # LCC-10-JB and Jl-02-1 are NOT swapped: their only inversion involves MID,
+  # which is tolerated (6.4), and swapping would replace their measured old
+  # surface carbon with a bomb-carbon sample.
+)
+
+stopifnot(all(SAMPLE_RELABELS$ID %in% radio$ID))
+
+radio <- radio %>%
+  left_join(SAMPLE_RELABELS, by = "ID") %>%
+  mutate(
+    Section_new = coalesce(new_section, Section_new),
+    depth       = coalesce(new_depth, depth)
+  ) %>%
+  select(-new_section, -new_depth, -relabel_reason)
+
+RELABELED_CORES <- radio %>% filter(ID %in% SAMPLE_RELABELS$ID) %>% distinct(soilID) %>% pull(soilID)
+cat("Profiles with relabelled samples:", length(RELABELED_CORES), "\n")
+```
+
+## 4.2  Join site metadata to radiocarbon data
+
+```{r rc-site-join}
+SKIP_PLOT <- c("Hung-Natali", "Baltzer", "Diaz-Veraverbeke")
+
+KEYS_FULL    <- c("project","StudyArea","Researcher","fire","site","plot","siteplot")
+KEYS_NO_PLOT <- c("project","StudyArea","Researcher","fire","site","siteplot")
+
+site_non_nwt  <- all.site2 %>% filter(tolower(project) != "nwt")
+radio_non_nwt <- radio     %>% filter(tolower(project) != "nwt")
+
+join_with_plot <- radio_non_nwt %>%
+  filter(!Researcher %in% SKIP_PLOT) %>%
+  left_join(
+    site_non_nwt %>%
+      filter(!Researcher %in% SKIP_PLOT) %>%
+      distinct(across(all_of(KEYS_FULL)), .keep_all = TRUE),
+    by = KEYS_FULL, relationship = "many-to-one"
+  )
+
+join_no_plot <- radio_non_nwt %>%
+  filter(Researcher %in% SKIP_PLOT) %>%
+  left_join(
+    site_non_nwt %>%
+      filter(Researcher %in% SKIP_PLOT) %>%
+      distinct(across(all_of(KEYS_NO_PLOT)), .keep_all = TRUE) %>%
+      select(-plot),
+    by = KEYS_NO_PLOT, relationship = "many-to-one"
+  ) %>%
+  { if ("plot.x" %in% names(.)) rename(., plot = plot.x) else . }
+
+non_nwt_join <- bind_rows(join_with_plot, join_no_plot)
+
+NWT_KEYS <- c("project","StudyArea","Researcher","fire","site")
+
+nwt_join <- radio %>%
+  filter(tolower(project) == "nwt") %>%
+  left_join(
+    all.site2 %>%
+      filter(tolower(project) == "nwt") %>%
+      distinct(across(all_of(NWT_KEYS)), .keep_all = TRUE) %>%
+      select(-plot),
+    by = NWT_KEYS, relationship = "many-to-one"
+  )
+
+drop_anon_cols <- function(df) select(df, -matches("^\\.\\.\\.\\d+$"))
+
+all_joined <- bind_rows(
+  drop_anon_cols(non_nwt_join),
+  drop_anon_cols(nwt_join)
+)
+
+SITE_CLEAN_COLS <- c(
+  "project", "StudyArea", "Researcher", "fire", "site", "plot", "siteplot",
+  "Year_of_Burn", "year", "stand_age", "stand_age_imputed", "stand_age14C",
+  "Stand_age_SD", "Stand_age_number",
+  "Latitude", "Longitude", "Elevation", "Slope", "Aspect",
+  "Moisture_Class", "ForestType", "Eco_Type", "reburn_class_final",
+  "Dom_Understory", "Dom_ground",
+  "burn_depth", "residualSOL_depth", "residualSOL.C", "SOL.C.Combusted", "prefireSOL.C",
+  "SOL_depth_SD", "SOL_depth_number",
+  "Burn_depth_SD", "Burn_depth_number",
+  "Thaw_depth", "Thaw_depth_SD", "Thaw_depth_number",
+  "Burn_depth_method", "age_method", "area_sampled", "area_sampled_trees",
+  "tree1_species", "tree1_density", "tree1_density_SD",
+  "tree1_basalarea", "tree1_basalarea_SD",
+  "tree2_species", "tree2_density", "tree2_density_SD",
+  "tree2_basalarea", "tree2_basalarea_SD",
+  "tree3_species", "tree3_density", "tree3_basalarea",
+  "Coordinate_Reference_System..projection.or.EPSG."
+)
+
+site_clean <- all_joined %>%
+  select(any_of(SITE_CLEAN_COLS)) %>%
+  distinct(project, StudyArea, Researcher, fire, site, plot, siteplot, .keep_all = TRUE)
+write_csv(site_clean, "LCC_Site_clean_05162026.csv")
+
+sr1 <- all_joined %>%
+  select(ID, project, Researcher:siteplot, soilID:rerolled)
+write_csv(sr1, "LCC_14C_long_clean_05162026.csv")
+```
+
+---
+
+# 5  Build the site-level input file
+
+One row per soil profile (soilID), holding every site-level value the pipeline
+uses: site metadata from section 3 (via the radiocarbon join in 4.2), spatial
+climate data, Walker/Mack measured SOL C pools, and the new field-measured SOL C
+combustion estimates. It contains no radiocarbon, CN, or derived values.
+
+```{r build-site-input}
+SITE_KEYS <- c("project","StudyArea","Researcher","fire","site","plot","siteplot")
+
+# Each soilID must sit in exactly one fire/site/plot combination
+key_check <- all_joined %>%
+  distinct(soilID, across(all_of(SITE_KEYS))) %>%
+  count(soilID) %>%
+  filter(n > 1)
+if (nrow(key_check) > 0) {
+  print(key_check)
+  stop("Some soilIDs map to more than one fire/site/plot combination")
+}
+
+
+# Profile-level site data
+site_input <- all_joined %>%
+  select(soilID, any_of(SITE_CLEAN_COLS)) %>%
+  distinct(soilID, .keep_all = TRUE)
+
+# Spatial data: Walker sites join on site + fire, others on site only
+sp_nonwalker <- read_csv("2025-12-02_LCC_SpatialData.csv", show_col_types = FALSE) %>%
+  mutate(site = as.character(site)) %>%
+  select(site, MAT, MAP, tree_cover) %>%
+  distinct(site, .keep_all = TRUE)
+
+sp_walker <- read_csv("2025-11-26_LC_site_SpatialData.csv", show_col_types = FALSE) %>%
+  mutate(site = as.character(site), fire = as.character(fire)) %>%
+  select(site, fire, MAT, MAP, tree_cover) %>%
+  distinct(site, fire, .keep_all = TRUE)
+
+site_input <- site_input %>%
+  mutate(.site = as.character(site), .fire = as.character(fire)) %>%
+  left_join(sp_walker %>%
+              rename(.site = site, .fire = fire,
+                     MAT_w = MAT, MAP_w = MAP, tc_w = tree_cover),
+            by = c(".site", ".fire")) %>%
+  left_join(sp_nonwalker %>%
+              rename(.site = site, MAT_nw = MAT, MAP_nw = MAP, tc_nw = tree_cover),
+            by = ".site") %>%
+  mutate(
+    MAT        = coalesce(MAT_w, MAT_nw),
+    MAP        = coalesce(MAP_w, MAP_nw),
+    tree_cover = coalesce(tc_w,  tc_nw)
+  ) %>%
+  select(-.site, -.fire, -MAT_w, -MAP_w, -tc_w, -MAT_nw, -MAP_nw, -tc_nw)
+
+
+PARISIEN_SAMPLE_YEAR <- 2021   # Parisien profiles were all sampled in 2021
+
+site_input <- site_input %>%
+  mutate(
+    # Parisien profiles from unburned stands, or from fires > 20 yr before
+    # sampling, are archived but not used in the manuscript
+    archive_only = Researcher == "Parisien" &
+      (is.na(Year_of_Burn) |
+         PARISIEN_SAMPLE_YEAR - suppressWarnings(as.numeric(Year_of_Burn)) > 20),
+    archive_only_reason = if_else(
+      archive_only,
+      "Parisien: unburned or fire > 20 yr before sampling (2021)",
+      NA_character_),
+
+    # Ecosystem class for profiles the 8-level Eco rules cannot classify.
+    # NP 11-1: white spruce upland (Picea glauca) in NWT. In NWT, "Other
+    # conifer" has no Upland/Lowland rule, so Eco would otherwise be NA.
+    Eco_override = case_when(
+      soilID == "NP 11-1 Burned" ~ "Western NA Upland Spruce",
+      TRUE                       ~ NA_character_
+    )
+  )
+
+# Check: expect 8 archive-only profiles (NP 11-1 Burned and NP 19-1 Burned are used)
+site_input %>% filter(Researcher == "Parisien") %>%
+  select(soilID, Year_of_Burn, archive_only, Eco_override)
+
+
+
+# Walker/Mack measured SOL pools (joined on site, as in the original pipeline)
+mw_sol <- read_csv("NWT_walker_SOL_C.csv", show_col_types = FALSE) %>%
+  select(site,
+         SOL.C.Combusted_WM = SOL.C.Combusted,
+         prefireSOL.C_WM    = prefire.SOL.C,
+         residualSOL.C_WM   = residualSOL.C)
+
+site_input <- site_input %>%
+  left_join(mw_sol, by = "site", relationship = "many-to-one")
+
+# New field-measured SOL C combustion (Diaz-Veraverbeke, Gundale, Metcalfe)
+new_comb <- read_csv("LCC_newSOLcombustion.csv", show_col_types = FALSE) %>%
+  group_by(soilID) %>%
+  summarise(SOL.C.Combusted_profile = mean(SOL.C.Combusted, na.rm = TRUE),
+            .groups = "drop")
+
+site_input <- site_input %>%
+  left_join(new_comb, by = "soilID", relationship = "one-to-one")
+
+# Site classifications (formerly pipeline sections 6.8, 6.11 and 6.13).
+# StudyArea stays as in the source files because it is a join key; the
+# canonical names ("AK boreal", "AK maritime") are used here only to apply the
+# rules, and are set in the pipeline (6.7).
+site_input <- site_input %>%
+  mutate(
+    .sa = case_when(
+      StudyArea == "Alaska" ~ "AK boreal",
+      StudyArea == "Kenai"  ~ "AK maritime",
+      TRUE ~ StudyArea
+    ),
+    ft  = str_squish(str_to_lower(ForestType)),
+    eco = str_squish(str_to_lower(Eco_Type)),
+
+    ForestGroup = case_when(
+      # ── Siteplot-specific overrides ──────────────────────────────────────────
+      siteplot == "36_1" ~ "Deciduous/Mixed",       # post-fire aspen on BS site; Hayes
+      siteplot == "21_C" ~ "Black spruce",           # MIXED code but confirmed BS
+
+      # ── Walker rules ─────────────────────────────────────────────────────────
+      Researcher == "Walker" &
+        str_detect(tolower(ForestType), "non.forested|non-forested") ~ "Black spruce",
+      Researcher == "Walker/Mack"                                    ~ "Black spruce",
+      Researcher == "Walker" & .sa == "AK boreal" &
+        (is.na(ft) | ft == "")                                       ~ "Black spruce",
+
+      # ── From Eco_Type ─────────────────────────────────────────────────────────
+      str_detect(eco, "black spruce")                                ~ "Black spruce",
+
+      # ── From ForestType (explicit wins) ──────────────────────────────────────
+      !is.na(ft) & ft != "" &
+        str_detect(ft, "picea mariana|\\bpima\\b|black spruce")      ~ "Black spruce",
+      !is.na(ft) & ft != "" &
+        str_detect(ft, paste0("populus tremuloides|\\bpotr\\b|aspen|",
+                              "betula neoalaskana|paper birch|birch|\\bbene\\b|\\bmixed\\b")) ~ "Deciduous/Mixed",
+      !is.na(ft) & ft != "" &
+        str_detect(ft, paste0("pinus banksiana|pinus sylvestris|jack pine|scots pine|",
+                              "picea glauca|\\bpigl\\b|white spruce|",
+                              "picea abies|norwegian spruce|abies balsamea|balsam fir")) ~ "Other conifer",
+      !is.na(ft) &
+        str_detect(ft, paste0("non[. -]?forested|tundra|peatland|eriophorum|",
+                              "low deciduous shrub|betula nana|salix|",
+                              "empetrum nigrum|rhododendron subarcticum|vaccinium")) ~ "Tundra / Non-forested",
+
+      # ── Eco_Type fallbacks ────────────────────────────────────────────────────
+      (is.na(ft) | ft == "") &
+        str_detect(eco, "tundra|peatland|non[. -]?forested")         ~ "Tundra / Non-forested",
+      (is.na(ft) | ft == "") &
+        str_detect(eco, "white spruce|norwegian spruce|spruce upland|scots pine|young pine|jack pine") ~ "Other conifer",
+      (is.na(ft) | ft == "") &
+        str_detect(eco, "aspen|birch|mixed")                         ~ "Deciduous/Mixed",
+
+      TRUE ~ NA_character_
+    ),
+    ForestGroup = factor(ForestGroup,
+                         levels = c("Black spruce", "Other conifer",
+                                    "Deciduous/Mixed", "Tundra / Non-forested")),
+
+    Dom_species = case_when(
+      # Mixed — must precede single-species detection
+      str_detect(ft, "picea mariana") &
+        str_detect(ft, "pinus banksiana")                              ~ "Picea mariana / Pinus banksiana",
+      # Siteplot-specific overrides
+      siteplot == "21_C"                                               ~ "Picea mariana",
+      siteplot == "26_C"                                               ~ "Populus tremuloides / Betula neoalaskana",
+      siteplot %in% c("90_B","101_B")                                  ~ "Picea mariana / Betula neoalaskana",
+      siteplot == "Reid_LCC3"                                          ~ "Eriophorum vaginatum",
+      siteplot == "Jl-03"                                              ~ "Peatland",
+      Researcher == "Walker" &
+        str_detect(ft, "non.forested|non-forested")                    ~ "Picea mariana",
+      # Explicit ForestType wins
+      str_detect(ft, "picea mariana|\\bpima\\b")                       ~ "Picea mariana",
+      str_detect(ft, "picea glauca|\\bpigl\\b|white spruce")           ~ "Picea glauca",
+      str_detect(ft, "picea abies|norwegian spruce")                   ~ "Picea abies",
+      str_detect(ft, "pinus sylvestris|scots pine")                    ~ "Pinus sylvestris",
+      str_detect(ft, "pinus banksiana|jack pine")                      ~ "Pinus banksiana",
+      str_detect(ft, "abies balsamea|balsam fir")                      ~ "Abies balsamea",
+      str_detect(ft, "populus tremuloides|\\bpotr\\b|aspen")           ~ "Populus tremuloides",
+      str_detect(ft, "betula neoalaskana|\\bbene\\b|paper birch")      ~ "Betula neoalaskana",
+      str_detect(ft, "\\bmixed\\b|mixed.con")                          ~ "Mixed",
+      # Walker special cases
+      Researcher == "Walker/Mack"                                      ~ "Picea mariana",
+      Researcher == "Walker" & .sa == "AK boreal" &
+        (is.na(ForestType) | ForestType == "")                        ~ "Picea mariana",
+      # Tundra species (ft before eco so YKD tussock wins)
+      str_detect(ft, "eriophorum")                                     ~ "Eriophorum vaginatum",
+      str_detect(ft, "low deciduous|betula nana|vaccinium|rhododendron|empetrum") ~ "Low deciduous shrub",
+      str_detect(tolower(Eco_Type), "moist tussock|wet tussock")       ~ "Eriophorum vaginatum",
+      str_detect(eco, "tundra|peatland|non[. -]?forested")             ~ "Non-forested",
+      # Eco_Type fallbacks
+      str_detect(eco, "black spruce")                                  ~ "Picea mariana",
+      str_detect(eco, "scots pine|young pine")                         ~ "Pinus sylvestris",
+      str_detect(eco, "jack pine")                                     ~ "Pinus banksiana",
+      str_detect(eco, "white spruce|spruce upland")                    ~ "Picea glauca",
+      str_detect(eco, "norwegian spruce")                              ~ "Picea abies",
+      str_detect(eco, "aspen")                                         ~ "Populus tremuloides",
+      str_detect(eco, "birch")                                         ~ "Betula neoalaskana",
+      TRUE ~ NA_character_
+    ),
+
+    Moisture_Class = case_when(
+      tolower(Moisture_Class) %in% c("xeric")                      ~ "xeric",
+      tolower(Moisture_Class) %in% c("subxeric")                   ~ "subxeric",
+      tolower(Moisture_Class) %in% c("mesic-subxeric", "submesic") ~ "submesic",
+      tolower(Moisture_Class) %in% c("mesic")                      ~ "mesic",
+      tolower(Moisture_Class) %in% c("mesic-subhygric")            ~ "mesic-subhygric",
+      tolower(Moisture_Class) %in% c("subhygric", "subhydric")     ~ "subhygric",
+      TRUE ~ NA_character_
+    ),
+    Moisture_Class = factor(Moisture_Class,
+                            levels = c("xeric","subxeric","submesic",
+                                       "mesic","mesic-subhygric","subhygric"),
+                            ordered = TRUE),
+    Moisture_3 = case_when(
+      Moisture_Class %in% c("xeric","subxeric")            ~ "dry",
+      Moisture_Class %in% c("submesic","mesic")            ~ "moist",
+      Moisture_Class %in% c("mesic-subhygric","subhygric") ~ "wet",
+      TRUE ~ NA_character_
+    ),
+    Moisture_3 = factor(Moisture_3, levels = c("dry","moist","wet")),
+
+    AgeClass = case_when(
+      stand_age < 30             ~ "Short (<30 yr)",
+      between(stand_age, 30, 70) ~ "Mid (30-70 yr)",
+      stand_age > 70             ~ "Long (>70 yr)",
+      TRUE                       ~ NA_character_
+    ),
+    AgeClass = factor(AgeClass, levels = c("Short (<30 yr)","Mid (30-70 yr)","Long (>70 yr)"))
+  ) %>%
+  select(-.sa, -ft, -eco)
+
+cat("ForestGroup:\n");    print(table(site_input$ForestGroup, useNA = "ifany"))
+cat("Moisture_Class:\n"); print(table(site_input$Moisture_Class, useNA = "ifany"))
+cat("Dom_species unclassified:", sum(is.na(site_input$Dom_species)), "\n")
+
+stopifnot(!anyDuplicated(site_input$soilID))
+cat("Site input:", nrow(site_input), "profiles,", ncol(site_input), "columns\n")
+cat("MAT coverage:", sum(!is.na(site_input$MAT)), "/", nrow(site_input), "\n")
+cat("Walker/Mack measured SOL pools:", sum(!is.na(site_input$residualSOL.C_WM)), "\n")
+cat("New field combustion values:", sum(!is.na(site_input$SOL.C.Combusted_profile)), "\n")
+
+write_csv(site_input, "LCC_site_input.csv")
+```
