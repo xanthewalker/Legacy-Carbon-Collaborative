@@ -7,7 +7,7 @@
 ---
 # Overview
 
-The Legacy Carbon Collaborative compiled radiocarbon-dated soil organic layer (SOL) profiles from burned boreal and tundra sites across eight circumpolar regions (Alaska tundra, Alaska boreal, Alaska maritime, Yukon, Northwest Territories, Quebec, Newfoundland and Labrador, and Sweden). For each profile we estimated how much prefire, residual, and combusted SOL carbon was **legacy carbon**, meaning carbon that accumulated before the previous fire and persisted through it.
+The Legacy Carbon Collaborative compiled radiocarbon-dated soil organic layer (SOL) profiles from burned boreal and tundra sites across eight circumpolar regions. For each profile we estimated how much prefire, residual, and combusted SOL carbon was **legacy carbon**, meaning carbon that accumulated before the previous fire and persisted through it.
 
 This repository contains the full workflow: the input data from each contributing group, the pipeline that builds the profile-level dataset, the dataset itself, and the code that reproduces every statistic, figure, and table in the manuscript.
 
