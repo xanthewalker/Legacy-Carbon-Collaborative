@@ -131,3 +131,5 @@ If you use these data or code, please cite the paper and the archived release:
 > Walker, X. J. et al. ([year]). 
 > Walker, X. J. et al. ([year]). Data and code for "[Title]". [DOI]
 
+Claude (Opus 5.5; Anthropic) was used to assist with reviewing and restructuring R code for data processing and analysis, and with drafting code documentation. All code and outputs were reviewed, tested, and verified by the authors, who take full responsibility for the content.
+
