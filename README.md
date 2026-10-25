@@ -35,7 +35,7 @@ This repository contains:
 │   ├── LCC_LegacyCarbon_archive_data_dictionary.csv    # column definitions, units, and groups
 │   └── pipeline_inputs/
 │       ├── LCC_site_input.csv                          # site-level data, one row per soil profile
-│       ├── LCC_14C_long_clean_08262025.csv             # radiocarbon measurements, one row per sample
+│       ├── LCC_14C_long_clean.csv             # radiocarbon measurements, one row per sample
 │       └── LCC_Soil_CN_clean.csv                       # depth-wise soil C, N, and bulk density
 └── outputs/                                            # created when the code is run (not tracked)
 ```
