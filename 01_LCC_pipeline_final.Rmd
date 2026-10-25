@@ -1,0 +1,1881 @@
+---
+title: "Legacy Carbon Collaborative — Archive pipeline"
+author: "Xanthe Walker"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+
+knitr::opts_knit$set(root.dir = "C:/Users/xjw5/OneDrive - Northern Arizona University/NAU/Alaska - Leg C/Data/Legacy Carbon Collaborative")
+
+rm(list = ls())
+
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflicts_prefer(dplyr::lag)
+```
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(forcats)
+library(purrr)
+library(patchwork)
+library(reshape2)
+library(SoilR)
+library(Bchron)
+library(rcarbon)
+library(lme4)
+library(MuMIn)
+library(performance)
+library(glmmTMB)
+library(DHARMa)
+library(glue)
+```
+
+---
+
+# 1  Shared helpers
+
+```{r helpers}
+# Safe left_join: warns if RHS has duplicate keys
+safe_left_join <- function(x, y, by) {
+  dups <- y %>% count(across(all_of(by))) %>% filter(n > 1)
+  if (nrow(dups) > 0)
+    message("WARNING: duplicate RHS keys for join on: ", paste(by, collapse = ", "))
+  left_join(x, y, by = by)
+}
+
+# Safe division (returns NA instead of Inf / NaN)
+safe_div <- function(num, den) {
+  ifelse(is.finite(num) & is.finite(den) & den != 0, num / den, NA_real_)
+}
+
+# Shared ggplot theme used throughout
+theme_lcc <- function(...) {
+  theme_bw() +
+    theme(
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = 12),
+      axis.text.y  = element_text(size = 12),
+      axis.title.y = element_text(size = 14, vjust = 2),
+      legend.position = "top",
+      legend.title = element_blank(),
+      legend.text  = element_text(size = 12),
+      strip.text   = element_text(face = "bold", size = 14),
+      ...
+    )
+}
+
+# StudyArea display order
+STUDY_AREA_LEVELS <- c("AK tundra", "AK boreal", "AK maritime",
+                       "Yukon", "NWT", "Quebec", "NL", "Sweden")
+```
+
+---
+
+# 2  Build atmosphere / bomb-curve reference
+
+```{r atmosphere}
+# Atmospheric bomb curve: Hua et al. (2021) NH Zone 1, as annual means placed
+# at mid-year (used in 5.3). 
+bomb_annual <- as.data.frame(Hua2021$NHZone1) %>%
+  filter(Year >= 1950) %>%
+  group_by(yr = floor(Year)) %>%
+  summarise(F14C = mean(mean.F14C), .groups = "drop") %>%
+  mutate(year = yr + 0.5) %>%
+  arrange(year)
+
+BOMB_PEAK_YR <- bomb_annual$year[which.max(bomb_annual$F14C)]   # rising limb = before this
+curve_rising  <- bomb_annual %>% filter(year <= BOMB_PEAK_YR)
+curve_falling <- bomb_annual %>% filter(year >= BOMB_PEAK_YR)
+cat("Bomb peak (annual means):", BOMB_PEAK_YR, "F14C =", round(max(bomb_annual$F14C), 4), "\n")
+cat("Falling limb monotonic:", all(diff(curve_falling$F14C) < 0), "\n")
+
+```
+
+---
+
+# 3  Radiocarbon data
+
+```{r}
+rc_long <- read_csv("LCC_14C_long_clean.csv", show_col_types = FALSE) %>%
+  mutate(across(c(site, plot, siteplot), as.character))
+radio <- rc_long
+```
+
+# 4 Merge radicoabron and site data
+```{r}
+
+site_input <- read_csv("LCC_site_input.csv", show_col_types = FALSE)
+ARCHIVE_ONLY_SOILIDS <- site_input$soilID[coalesce(as.logical(site_input$archive_only), FALSE)]
+
+SITE_CLEAN_COLS <- c(
+  "project", "StudyArea", "Researcher", "fire", "site", "plot", "siteplot",
+  "Year_of_Burn", "year", "stand_age", "stand_age_imputed", "stand_age14C",
+  "Stand_age_SD", "Stand_age_number",
+  "Latitude", "Longitude", "Elevation", "Slope", "Aspect",
+  "Moisture_Class", "ForestType", "Eco_Type", "reburn_class_final",
+  "Dom_Understory", "Dom_ground",
+  "burn_depth", "residualSOL_depth", "residualSOL.C", "SOL.C.Combusted", "prefireSOL.C",
+  "SOL_depth_SD", "SOL_depth_number",
+  "Burn_depth_SD", "Burn_depth_number",
+  "Thaw_depth", "Thaw_depth_SD", "Thaw_depth_number",
+  "Burn_depth_method", "age_method", "area_sampled", "area_sampled_trees",
+  "tree1_species", "tree1_density", "tree1_density_SD",
+  "tree1_basalarea", "tree1_basalarea_SD",
+  "tree2_species", "tree2_density", "tree2_density_SD",
+  "tree2_basalarea", "tree2_basalarea_SD",
+  "tree3_species", "tree3_density", "tree3_basalarea",
+  "Coordinate_Reference_System..projection.or.EPSG."
+)
+
+all_joined <- rc_long %>%
+  left_join(site_input %>% select(soilID, Year_of_Burn, year),
+            by = "soilID", relationship = "many-to-one")
+
+# NWT siteplot left empty for the CN joins; restored in section 7 from `radio`
+rc_long <- rc_long %>%
+  mutate(siteplot = if_else(tolower(project) == "nwt", NA_character_, siteplot))
+```
+
+
+# 5  Radiocarbon age assignment
+
+## 5.1  Classify pre-/post-bomb
+
+```{r rc-bomb-classify}
+# Classified on F14C, the measured quantity. Pre-1950 carbon never exceeds
+# F14C ~0.99, so F14C > 1 means the sample contains bomb carbon. 
+rc_classified <- rc_long %>%
+  mutate(
+    carbon_era = case_when(
+      F14C > 1  ~ "Post-bomb",
+      F14C <= 1 ~ "Pre-bomb",
+      TRUE      ~ NA_character_
+    )
+  )
+
+prebomb  <- filter(rc_classified, carbon_era == "Pre-bomb")
+postbomb <- filter(rc_classified, carbon_era == "Post-bomb")
+
+
+```
+
+## 5.2  Pre-bomb: Bchron calibration
+
+```{r rc-prebomb}
+prebomb <- prebomb %>%
+  mutate(
+    F14C.err_abs = X14C.err / 1000,
+    C14age       = -8033 * log(F14C),
+    C14age_sd    = 8033 * F14C.err_abs / F14C
+  )
+cal_pre <- BchronCalibrate(
+  ages      = prebomb$C14age,
+  ageSds    = prebomb$C14age_sd,
+  calCurves = rep("intcal20", nrow(prebomb)),
+  ids       = prebomb$ID,
+  allowOutside = TRUE
+)
+
+prebomb$calibrated_median <- sapply(
+  cal_pre,
+  function(x) median(x$ageGrid[x$densities == max(x$densities)])
+)
+prebomb$calendar_year_median <- 1950 - prebomb$calibrated_median
+
+# Sanity check: age SDs should be ~9-40 yr (not ~900-4000)
+summary(prebomb$C14age_sd)
+
+# 95% highest-density regions: number of separate solutions and overall range
+# (hdr() returns intervals in years BP; converted to calendar years here)
+cal_hdr <- purrr::map(cal_pre, ~ Bchron::hdr(.x, prob = 0.95))
+
+prebomb <- prebomb %>%
+  mutate(
+    cal_n_modes = purrr::map_int(cal_hdr, length),
+    cal_lo95    = 1950 - purrr::map_dbl(cal_hdr, ~ max(unlist(.x))),
+    cal_hi95    = 1950 - purrr::map_dbl(cal_hdr, ~ min(unlist(.x)))
+  )
+
+prebomb %>% count(cal_n_modes)
+
+prebomb %>%
+  filter(cal_n_modes > 1) %>%
+  select(soilID, Section_new, depth, X14C, calendar_year_median, cal_lo95, cal_hi95) %>%
+  arrange(soilID, depth)
+
+# Candidate solutions per sample: each 95% interval holding >= 10% of the
+# probability, represented by its most probable year. Used by the
+# stratigraphic-order rule in 5.6.
+cand_pre <- purrr::pmap_dfr(
+  list(cal = cal_pre, ints = cal_hdr, id = prebomb$ID),
+  function(cal, ints, id) {
+    tot <- sum(cal$densities)
+    purrr::map_dfr(ints, function(iv) {
+      inside <- cal$ageGrid >= min(iv) & cal$ageGrid <= max(iv)
+      tibble(
+        ID        = id,
+        cand_year = 1950 - cal$ageGrid[inside][which.max(cal$densities[inside])],
+        mass      = sum(cal$densities[inside]) / tot
+      )
+    })
+  }
+) %>%
+  filter(mass >= 0.10)
+
+cand_pre %>% count(ID, name = "n_major") %>% count(n_major)
+```
+
+## 5.3  Post-bomb: read calendar years off the bomb curve
+
+```{r rc-postbomb}
+# Post-bomb samples (F14C > 1) are dated by reading their F14C off the
+# atmospheric bomb curve (Hua et al. 2021, NH Zone 1). The curve is reduced to
+# annual means placed at mid-year.
+#
+# Every post-bomb F14C value (below the peak) crosses the curve twice: once
+# on the rising limb (1955-1964) and once on the falling limb (1964 on).
+# Both years are calculated here; which one a sample gets is decided by the
+# depth rules in 5.6. 
+#
+# Special cases (flagged in curve_flag):
+#  - F14C above the annual peak: assigned the peak year ("above_peak").
+#  - F14C below the last falling-limb value (curve ends 2019): the falling limb
+#    is extended using the linear trend of its last 10 years ("extrapolated").
+#
+# Residual soil carbon cannot post-date the most recent fire: a solution later than
+# Year_of_Burn + FIRE_CAP_TOL is marked as not allowed (except archive-only
+# profiles, sampled decades after fire). 5.6 uses the other limb if only that
+# one is allowed. 
+
+FIRE_CAP_TOL    <- 0                       # yr
+NO_FIRE_CAP     <- ARCHIVE_ONLY_SOILIDS    # soilIDs
+EXTRAP_TREND_YR <- 10                      # yr of the falling limb used to extend it
+
+tail_fit <- lm(F14C ~ year, data = tail(curve_falling, EXTRAP_TREND_YR))
+
+# Year(s) where a limb crosses F14C value x (linear interpolation between annual means)
+read_limb <- function(x, crv, limb) {
+  yv <- crv$F14C; xv <- crv$year; n <- length(yv)
+  if (is.na(x)) return(c(NA_real_, NA))
+  if (x >= max(yv)) return(c(BOMB_PEAK_YR, "above_peak"))
+  i <- which((yv[-n] - x) * (yv[-1] - x) <= 0 & yv[-n] != yv[-1])
+  if (length(i) == 0) {
+    if (limb == "falling" && x < min(yv)) {
+      yr <- (x - coef(tail_fit)[1]) / coef(tail_fit)[2]
+      return(c(unname(yr), "extrapolated"))
+    }
+    return(c(NA_real_, "no_crossing"))
+  }
+  yrs <- xv[i] + (x - yv[i]) / (yv[i + 1] - yv[i]) * (xv[i + 1] - xv[i])
+  if (length(i) > 1) return(c(mean(range(yrs)), paste0(limb, "_plateau")))
+  c(yrs, "ok")
+}
+
+fire_cap <- all_joined %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  transmute(ID, burn_year = suppressWarnings(as.numeric(Year_of_Burn)))
+
+postbomb_1 <- postbomb %>%
+  left_join(fire_cap, by = "ID") %>%
+  mutate(cap = if_else(soilID %in% NO_FIRE_CAP | is.na(burn_year),
+                       NA_real_, burn_year + FIRE_CAP_TOL))
+
+rise <- purrr::map(postbomb_1$F14C, read_limb, crv = curve_rising,  limb = "rising")
+fall <- purrr::map(postbomb_1$F14C, read_limb, crv = curve_falling, limb = "falling")
+
+postbomb_1 <- postbomb_1 %>%
+  mutate(
+    year_rising   = as.numeric(purrr::map_chr(rise, 1)),
+    flag_rising   = purrr::map_chr(rise, 2),
+    year_falling  = as.numeric(purrr::map_chr(fall, 1)),
+    flag_falling  = purrr::map_chr(fall, 2),
+    rising_ok     = !is.na(year_rising)  & (is.na(cap) | year_rising  <= cap),
+    falling_ok    = !is.na(year_falling) & (is.na(cap) | year_falling <= cap),
+    # Provisional age (replaced by the depth rules in 5.6): falling limb if allowed
+    calendar_year_median = case_when(falling_ok ~ year_falling,
+                                     rising_ok  ~ year_rising,
+                                     TRUE       ~ NA_real_)
+  )
+
+# Both solutions per sample (used for the stand-origin flag, rule 2)
+cand_post <- bind_rows(
+  postbomb_1 %>% filter(rising_ok)  %>% transmute(ID, cand_year = year_rising,  mass = 1),
+  postbomb_1 %>% filter(falling_ok) %>% transmute(ID, cand_year = year_falling, mass = 1)
+)
+
+postbomb_1 %>% count(flag_rising, flag_falling)
+postbomb_1 %>% count(rising_ok, falling_ok)
+```
+
+
+## 5.4  Combine pre- and post-bomb ages
+
+```{r rc-combine}
+rc_age <- bind_rows(prebomb, postbomb_1) %>%
+  mutate(F14C.err_abs = X14C.err / 1000) %>%   # absolute Fm error, same units for all samples
+  select(project, Researcher, StudyArea, fire, site, plot, siteplot,
+         soilID, ID, Section_new, depth,
+         X14C, X14C.err, F14C, F14C.err_abs, notes, calendar_year_median)
+```
+
+
+## 5.5  Core-level structural corrections
+
+```{r rc-structural-fixes}
+# Mineral basal samples: in these profiles the BOTTOM sample was mineral soil
+# (confirmed in the lab), so it does not date the organic layer. The BOTTOM sample
+# is dropped and MID becomes the basal (deepest organic) date.
+MINERAL_BOTTOM <- c("LCC-11-JB", "LCC-12-JB", "Sweden B", "WF-LCC-1")
+RELABEL_MID_TO_BOTTOM <- MINERAL_BOTTOM   # name used in later diagnostic chunks
+
+rc_age <- rc_age %>%
+  filter(!(soilID %in% MINERAL_BOTTOM & Section_new == "BOTTOM")) %>%
+  mutate(Section_new = if_else(soilID %in% MINERAL_BOTTOM & Section_new == "MID",
+                               "BOTTOM", Section_new))
+
+cat("Profiles with a mineral basal sample (MID used as basal date):",
+    length(MINERAL_BOTTOM), "\n")
+```
+
+## 5.6  Age rules: limb rule, stratigraphic order, and stand-origin flag
+
+```{r rc-order-rules}
+# Pre-bomb samples keep their Bchron mode (5.2). Post-bomb samples get the
+# rising- or falling-limb year from 5.3, chosen by these rules:
+#
+# Rule 1a - limb rule, applied down each profile (TOP -> BOTTOM; deeper = older).
+#  * The first post-bomb sample is compared with the sample directly below it,
+#    if that sample is within 4cm. It is assumed to lie on the same side of
+#    the bomb peak as that sample:
+#      - higher F14C than the sample below -> rising limb
+#      - lower F14C than the sample below  -> falling limb
+#      - sample below is pre-bomb          -> rising limb (closest in time to
+#        pre-1950 carbon; see rule 1d for weak bomb signals)
+#  * Each deeper post-bomb sample then follows from the one above it:
+#      - above is on the rising limb  -> rising (older on the rising limb)
+#      - above is on the falling limb and this sample has higher F14C -> falling
+#      - above is on the falling limb and this sample has lower F14C  -> rising
+#        (the profile has crossed the bomb peak)
+#  * Pairs whose F14C differs by less than 2 sigma follow the same rule and are
+#    flagged (within_error). Equal values are treated as falling.
+#  * V-shaped profiles (TOP, MID and BOTTOM all post-bomb; MID lower than both):
+#    MID is treated as the odd sample (MID inversions are tolerated, 6.4) and
+#    all three take the limb given by TOP vs BOTTOM (flagged "V_top_vs_bottom").
+#  * A post-bomb sample with no sample within 4cm below it to compare with
+#    gets the falling limb (flagged "no_sample_below" / "no_close_sample_below").
+#  * If the chosen limb's year post-dates the fire (5.3) and the other limb's
+#    does not, the other limb is used (flagged "fire_cap_switch").
+#
+
+
+ORDER_TOL_YR <- 0   # yr
+ADJ_CM       <- 4   # cm; max gap to the sample below used to set a limb (rules 1a, 1d)
+
+cand_all <- bind_rows(cand_pre, cand_post)   # all possible ages (rule 2)
+
+rc_age <- rc_age %>%
+  mutate(
+    core       = soilID,
+    sec_rank   = match(Section_new, c("TOP","MID","BOTTOM")),
+    age_source = case_when(
+      ID %in% prebomb$ID    ~ "prebomb_mode",
+      ID %in% postbomb_1$ID ~ "postbomb_curve",
+      TRUE                  ~ NA_character_
+    )
+  )
+
+# ---- Rule 1a: walk down each profile -------------------------------------
+walk_limbs <- function(F, err, post, depth) {
+  n <- length(F)
+  limb <- rep(NA_character_, n); basis <- rep(NA_character_, n)
+  within <- rep(NA, n)
+  close_below <- function(k) k < n && (depth[k + 1] - depth[k]) <= ADJ_CM
+  # V-shaped profile: TOP, MID, BOTTOM all post-bomb and MID lower than both
+  if (n == 3 && all(post) && F[2] < F[1] && F[2] < F[3] && close_below(1)) {
+    l <- if (F[1] > F[3]) "rising" else "falling"
+    return(tibble(limb = rep(l, 3), limb_basis = "V_top_vs_bottom",
+                  within_error = abs(F[1] - F[3]) <= 2 * sqrt(err[1]^2 + err[3]^2)))
+  }
+  for (k in seq_len(n)) {
+    if (!post[k]) next
+    if (k > 1 && post[k - 1] && !is.na(limb[k - 1])) {
+      within[k] <- abs(F[k] - F[k - 1]) <= 2 * sqrt(err[k]^2 + err[k - 1]^2)
+      if (limb[k - 1] == "rising") {
+        limb[k]  <- "rising"
+        basis[k] <- if (F[k] > F[k - 1]) "below_rising_but_higher" else "below_rising"
+      } else if (F[k] >= F[k - 1]) {
+        limb[k] <- "falling"; basis[k] <- "below_falling"
+      } else {
+        limb[k] <- "rising";  basis[k] <- "crossed_peak"
+      }
+    } else if (close_below(k)) {
+      if (!post[k + 1]) {
+        limb[k] <- "rising"; basis[k] <- "above_prebomb"
+      } else {
+        within[k] <- abs(F[k] - F[k + 1]) <= 2 * sqrt(err[k]^2 + err[k + 1]^2)
+        if (F[k] > F[k + 1])      { limb[k] <- "rising";  basis[k] <- "higher_than_below" }
+        else if (F[k] < F[k + 1]) { limb[k] <- "falling"; basis[k] <- "lower_than_below" }
+        else                      { limb[k] <- "falling"; basis[k] <- "tie" }
+      }
+    } else {
+      limb[k]  <- "falling"
+      basis[k] <- if (k < n) "no_close_sample_below" else "no_sample_below"
+    }
+  }
+  tibble(limb = limb, limb_basis = basis, within_error = within)
+}
+
+limb_walk <- rc_age %>%
+  filter(!is.na(calendar_year_median)) %>%
+  arrange(core, sec_rank, depth) %>%
+  group_by(core) %>%
+  group_modify(function(d, key) {
+    bind_cols(d %>% select(ID),
+              walk_limbs(d$F14C, d$F14C.err_abs, d$age_source == "postbomb_curve", d$depth))
+  }) %>%
+  ungroup() %>%
+  filter(!is.na(limb)) %>%
+  left_join(postbomb_1 %>% select(ID, year_rising, year_falling, rising_ok, falling_ok,
+                                  flag_rising, flag_falling),
+            by = "ID") %>%
+  mutate(
+    fire_cap_switch = (limb == "falling" & !falling_ok & rising_ok) |
+                      (limb == "rising"  & !rising_ok  & falling_ok),
+    limb       = if_else(fire_cap_switch, if_else(limb == "falling", "rising", "falling"), limb),
+    limb_basis = if_else(fire_cap_switch, paste0(limb_basis, "; fire_cap_switch"), limb_basis),
+    limb_year  = if_else(limb == "rising", year_rising, year_falling),
+    curve_flag = if_else(limb == "rising", flag_rising, flag_falling),
+    limb_year  = if_else(if_else(limb == "rising", rising_ok, falling_ok), limb_year, NA_real_)
+  )
+
+cat("Post-bomb samples by limb and basis:\n")
+limb_walk %>% count(limb, limb_basis) %>% print(n = Inf)
+cat("Curve special cases:\n")
+limb_walk %>% count(curve_flag) %>% print()
+cat("Within-error comparisons:", sum(limb_walk$within_error, na.rm = TRUE), "\n")
+cat("Post-bomb samples with no allowed year on either limb:", sum(is.na(limb_walk$limb_year)), "\n")
+
+rc_age <- rc_age %>%
+  left_join(limb_walk %>% select(ID, limb, limb_basis, within_error, curve_flag, limb_year),
+            by = "ID") %>%
+  mutate(calendar_year_median = if_else(age_source == "postbomb_curve" & !is.na(limb_year),
+                                        limb_year, calendar_year_median)) %>%
+  select(-limb_year)
+
+# TOP vs the sample below it (used by rule 1d and for reporting)
+limb_rule <- rc_age %>%
+  filter(!is.na(X14C), !is.na(calendar_year_median)) %>%
+  group_by(core) %>%
+  summarise(
+    partner      = if (any(Section_new == "MID")) "MID" else "BOTTOM",
+    top_post     = any(Section_new == "TOP" & age_source == "postbomb_curve"),
+    partner_pre  = any(Section_new == partner & age_source == "prebomb_mode"),
+    partner_post = any(Section_new == partner & age_source == "postbomb_curve"),
+    depth_gap    = mean(depth[Section_new == partner]) - mean(depth[Section_new == "TOP"]),
+    limb         = first(limb[Section_new == "TOP"]),
+    .groups = "drop"
+  ) %>%
+  filter(top_post, partner_pre | partner_post) %>%
+  mutate(pair_type = if_else(partner_post, "both_post", "partner_pre"))
+
+# ---- Rule 1b: stratigraphic order ----------------------------------------
+order_ok <- function(yrs) {
+  n <- length(yrs)
+  if (n < 2) return(TRUE)
+  for (i in seq_len(n - 1)) for (j in (i + 1):n)
+    if (yrs[j] - yrs[i] > ORDER_TOL_YR) return(FALSE)
+  TRUE
+}
+
+violating_cores <- rc_age %>%
+  filter(!is.na(calendar_year_median)) %>%
+  arrange(core, sec_rank) %>%
+  group_by(core) %>%
+  summarise(violates = !order_ok(calendar_year_median), .groups = "drop") %>%
+  filter(violates) %>%
+  pull(core)
+
+best_ordered <- function(years_list, mass_list) {
+  idx <- expand.grid(lapply(years_list, seq_along))
+  yrs <- matrix(sapply(seq_along(years_list), function(j) years_list[[j]][idx[[j]]]),
+                nrow = nrow(idx))
+  ms  <- matrix(sapply(seq_along(mass_list),  function(j) mass_list[[j]][idx[[j]]]),
+                nrow = nrow(idx))
+  ok  <- apply(yrs, 1, order_ok)
+  if (!any(ok)) return(NULL)
+  score <- apply(ms, 1, prod)
+  best  <- which(ok)[which.max(score[ok])]
+  list(years = yrs[best, ], share = score[best] / sum(score[ok]))
+}
+
+# Candidates: pre-bomb samples use their major Bchron solutions; post-bomb
+# samples have one fixed year (rule 1a)
+cands <- rc_age %>%
+  filter(core %in% violating_cores, !is.na(calendar_year_median)) %>%
+  select(ID, core, sec_rank, age_source, calendar_year_median) %>%
+  left_join(cand_pre, by = "ID") %>%
+  mutate(
+    use_cands = age_source == "prebomb_mode" & !is.na(cand_year),
+    cand_year = if_else(use_cands, cand_year, calendar_year_median),
+    mass      = if_else(use_cands, mass, 1)
+  ) %>%
+  distinct(ID, core, sec_rank, cand_year, mass)
+
+order_fixes <- cands %>%
+  arrange(core, sec_rank) %>%
+  group_by(core) %>%
+  group_modify(function(d, key) {
+    s   <- split(d, factor(d$ID, levels = unique(d$ID)))
+    res <- best_ordered(lapply(s, `[[`, "cand_year"), lapply(s, `[[`, "mass"))
+    if (is.null(res)) {
+      return(tibble(ID = names(s), new_year = NA_real_,
+                    order_share = NA_real_, resolved = FALSE))
+    }
+    tibble(ID = names(s), new_year = unname(res$years),
+           order_share = res$share, resolved = TRUE)
+  }) %>%
+  ungroup()
+
+unresolved_cores <- order_fixes %>% filter(!resolved) %>% distinct(core) %>% pull(core)
+
+rc_age <- rc_age %>%
+  left_join(order_fixes %>% select(ID, new_year, order_share), by = "ID") %>%
+  mutate(
+    order_flag = case_when(
+      core %in% unresolved_cores ~ "inversion_unresolved",
+      core %in% violating_cores  ~ "order_fixed",
+      TRUE                       ~ "ok"
+    ),
+    changed              = !is.na(new_year) & new_year != calendar_year_median,
+    old_year             = calendar_year_median,
+    age_source           = if_else(changed, sub("_mode$", "_rule_fix", age_source), age_source),
+    calendar_year_median = if_else(changed, new_year, calendar_year_median)
+  )
+
+cat("Cores out of depth order after rule 1a:", length(violating_cores),
+    "| fixed by alternative pre-bomb solutions:", length(setdiff(violating_cores, unresolved_cores)),
+    "| unresolved:", length(unresolved_cores), "\n")
+rc_age %>%
+  filter(core %in% violating_cores) %>%
+  arrange(order_flag, core, sec_rank) %>%
+  select(order_flag, core, Section_new, depth, F14C, age_source, limb,
+         old_year, calendar_year_median, order_share) %>%
+  print(n = Inf)
+
+rc_age <- rc_age %>% select(-new_year, -changed, -old_year)
+
+# Rule 1c - rising-limb spread. In profiles where every sample contains bomb
+# carbon and the rules above put them all on the rising limb, D14C usually
+# declines with depth (bomb carbon mixed downward), and matching each sample
+# to the curve compresses the whole profile into 1-3 years. For these profiles
+# (TOP-BOTTOM span < MIN_YR_PER_CM), ages are spread over the rising limb by
+# depth: TOP = 1964 (bomb peak); each deeper sample is SURFACE_RATE years per
+# cm older, but not older than 1955 (first year atmospheric D14C > 0).
+# SURFACE_RATE is the median years per cm between TOP and MID in profiles
+# where both are unambiguously on the falling limb.
+MIN_YR_PER_CM  <- 1
+SPREAD_TOP_YR  <- 1964
+SPREAD_BASE_YR <- 1955
+
+SURFACE_RATE <- rc_age %>%
+  filter(Section_new %in% c("TOP","MID"), !is.na(calendar_year_median),
+         !soilID %in% ARCHIVE_ONLY_SOILIDS) %>%
+  group_by(core) %>%
+  filter(n() == 2, all(calendar_year_median > BOMB_PEAK_YR)) %>%
+  summarise(
+    r = (first(calendar_year_median[Section_new == "TOP"]) - first(calendar_year_median[Section_new == "MID"])) /
+        (first(depth[Section_new == "MID"]) - first(depth[Section_new == "TOP"])),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(r), r >= 0) %>%
+  pull(r) %>%
+  median()
+cat("Surface accumulation (median yr per cm, falling-limb TOP/MID pairs):", round(SURFACE_RATE, 2), "\n")
+
+spread_cores <- rc_age %>%
+  filter(!is.na(calendar_year_median), order_flag != "inversion_unresolved") %>%
+  group_by(core) %>%
+  filter(any(Section_new == "TOP"), any(Section_new == "BOTTOM")) %>%
+  summarise(
+    all_post   = all(grepl("^postbomb", age_source)),
+    all_rising = all(calendar_year_median < BOMB_PEAK_YR),
+    yr_per_cm  = (calendar_year_median[Section_new == "TOP"][1] -
+                  calendar_year_median[Section_new == "BOTTOM"][1]) /
+                 (depth[Section_new == "BOTTOM"][1] - depth[Section_new == "TOP"][1]),
+    .groups = "drop"
+  ) %>%
+  filter(all_post, all_rising, yr_per_cm < MIN_YR_PER_CM) %>%
+  pull(core)
+
+rc_age <- rc_age %>%
+  group_by(core) %>%
+  mutate(
+    top_depth   = suppressWarnings(min(depth[!is.na(calendar_year_median)])),
+    spread_year = pmax(SPREAD_BASE_YR, SPREAD_TOP_YR - (depth - top_depth) * SURFACE_RATE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    in_spread            = core %in% spread_cores & !is.na(calendar_year_median),
+    age_source           = if_else(in_spread, "rising_spread", age_source),
+    calendar_year_median = if_else(in_spread, spread_year, calendar_year_median)
+  ) %>%
+  select(-top_depth, -spread_year, -in_spread)
+
+cat("Profiles given rising-limb spread ages:", length(spread_cores), "\n")
+rc_age %>%
+  filter(core %in% spread_cores) %>%
+  arrange(core, sec_rank) %>%
+  select(core, Section_new, depth, X14C, calendar_year_median) %>%
+  print(n = Inf)
+
+# Rule 1d - TOP takes the age of the sample below it. If TOP is post-bomb with
+# D14C <= TOP_FROM_MID_MAX_D14C and the sample directly below it (MID, or
+# BOTTOM if no MID; within ADJ_CM) is pre-bomb, TOP is
+# assigned the age of the sample below. This age is an upper bound for the
+# residual surface. Applies instead of the rising-limb date from rule 1a.
+TOP_FROM_MID_MAX_D14C <- 20
+
+tfm <- limb_rule %>%
+  filter(pair_type == "partner_pre", depth_gap <= ADJ_CM) %>%
+  select(core, partner) %>%
+  inner_join(rc_age %>% filter(Section_new == "TOP") %>%
+               distinct(core, .keep_all = TRUE) %>% select(core, top_x = X14C),
+             by = "core") %>%
+  filter(top_x <= TOP_FROM_MID_MAX_D14C) %>%
+  inner_join(rc_age %>% select(core, Section_new, partner_year = calendar_year_median),
+             by = c("core", "partner" = "Section_new")) %>%
+  filter(!is.na(partner_year))
+
+top_from_mid_cores <- tfm$core
+
+rc_age <- rc_age %>%
+  left_join(tfm %>% select(core, partner_year), by = "core") %>%
+  mutate(
+    is_tfm               = Section_new == "TOP" & !is.na(partner_year),
+    age_source           = if_else(is_tfm, "top_from_mid", age_source),
+    calendar_year_median = if_else(is_tfm, partner_year, calendar_year_median)
+  ) %>%
+  select(-partner_year, -is_tfm)
+
+cat("Profiles where TOP takes the age of the sample below:", length(top_from_mid_cores), "\n")
+tfm %>% arrange(top_x) %>% print(n = Inf)
+
+# Rule 2: flag samples whose major solutions straddle stand origin
+origin <- all_joined %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  transmute(ID, origin_year = suppressWarnings(as.numeric(year)))
+
+straddle_ids <- cand_all %>%
+  inner_join(origin, by = "ID") %>%
+  filter(!is.na(origin_year)) %>%
+  group_by(ID) %>%
+  summarise(straddles = any(cand_year < origin_year) & any(cand_year > origin_year),
+            .groups = "drop") %>%
+  filter(straddles) %>%
+  pull(ID)
+
+rc_age <- rc_age %>%
+  mutate(straddles_origin = ID %in% straddle_ids)
+
+rc_age %>% count(age_source)
+rc_age %>% filter(straddles_origin) %>% count(Section_new)
+
+
+```
+
+### Checks that the rules worked
+
+```{r rc-age-checks}
+# 1. No residual surface (TOP) may post-date its fire (archive-only exempt)
+top_after_fire <- rc_age %>%
+  left_join(fire_cap, by = "ID") %>%
+  filter(Section_new == "TOP", !soilID %in% NO_FIRE_CAP,
+         calendar_year_median > burn_year + FIRE_CAP_TOL)
+cat("TOP samples dated after their fire:", nrow(top_after_fire), "\n")
+stopifnot(nrow(top_after_fire) == 0)
+
+# 2. Every post-bomb sample received a limb and an allowed year
+cat("Post-bomb samples without a year:", sum(is.na(limb_walk$limb_year)), "\n")
+
+write_csv(rc_age %>% select(-core, -sec_rank), "LCC_soil_age_clean.csv")
+```
+
+---
+
+# 6  C pools and legacy C partitioning
+
+## 6.1  Load data and join
+
+```{r cn-load}
+site_input <- read_csv("LCC_site_input.csv", show_col_types = FALSE)
+
+# Site table at the fire/site/plot level, as used by the joins below
+site <- site_input %>%
+  select(any_of(c(SITE_CLEAN_COLS, "ForestGroup", "Dom_species", "Moisture_3", "AgeClass",
+                  "Eco_override"))) %>%
+  distinct(project, StudyArea, Researcher, fire, site, plot, siteplot, .keep_all = TRUE)
+
+rc_age <- read_csv("LCC_soil_age_clean.csv", show_col_types = FALSE)
+cn     <- read.csv("LCC_Soil_CN_clean.csv") %>%
+  mutate(siteplot = if_else(field_id == "DragMooTrip25C", "25_C", siteplot))
+
+KEYS <- c("project","StudyArea","Researcher","fire","site","plot","siteplot")
+
+LC2 <- rc_age %>%
+  left_join(site, by = KEYS, relationship = "many-to-one") %>%
+  distinct()
+
+LC2_wide <- LC2 %>%
+  dplyr::select(project, Researcher, StudyArea, fire, site, plot, siteplot,
+                soilID, Section_new, X14C, calendar_year_median, depth) %>%
+  pivot_wider(names_from  = Section_new,
+              values_from = c(X14C, calendar_year_median, depth),
+              names_sep   = "_",
+              values_fn   = mean)
+
+LC3 <- LC2_wide %>%
+  left_join(site, by = KEYS, relationship = "many-to-one") %>%
+  mutate(
+    year = suppressWarnings(as.numeric(year)),
+    calendar_year_median_BOTTOM = suppressWarnings(as.numeric(calendar_year_median_BOTTOM)),
+    calendar_year_median_TOP    = suppressWarnings(as.numeric(calendar_year_median_TOP)),
+    LC.present   = if_else(!is.na(calendar_year_median_BOTTOM) &
+                             year < calendar_year_median_BOTTOM, "Absent", "Present"),
+    LC.combusted = if_else(!is.na(calendar_year_median_TOP) &
+                             year > calendar_year_median_TOP, "Lost", "Accumulate"),
+    legacyCpresent.num   = as.integer(LC.present   == "Present"),
+    legacyCcombusted.num = as.integer(LC.combusted == "Lost")
+  )
+```
+
+```{r pl-bd-impute}
+# Depth-specific mean bd.fine for Pare-Laganiere
+pl_bd_means <- cn %>%
+  filter(Researcher == "Pare-Laganiere", !is.na(bd.fine)) %>%
+  group_by(soil_depth_top_cm) %>%
+  summarise(bd_imputed = mean(bd.fine, na.rm = TRUE), .groups = "drop")
+
+pl_bd_overall <- cn %>%
+  filter(Researcher == "Pare-Laganiere", !is.na(bd.fine)) %>%
+  summarise(bd_imputed = mean(bd.fine, na.rm = TRUE)) %>%
+  pull(bd_imputed)
+
+cn <- cn %>%
+  left_join(
+    pl_bd_means %>% mutate(Researcher = "Pare-Laganiere"),
+    by = c("Researcher", "soil_depth_top_cm")
+  ) %>%
+  mutate(
+    bd.fine = case_when(
+      Researcher == "Pare-Laganiere" & is.na(bd.fine) & !is.na(bd_imputed) ~ bd_imputed,
+      Researcher == "Pare-Laganiere" & is.na(bd.fine)                      ~ pl_bd_overall,
+      TRUE ~ bd.fine
+    ),
+    sample.depth = case_when(
+      Researcher == "Pare-Laganiere" & is.na(sample.depth) ~
+        as.numeric(soil_depth_bottom_cm - soil_depth_top_cm),
+      TRUE ~ sample.depth
+    ),
+    gC.m2 = if_else(
+      Researcher == "Pare-Laganiere" & is.na(gC.m2) & !is.na(bd.fine) & !is.na(C_weight_per),
+      C_weight_per / 100 * bd.fine * sample.depth * 10000,
+      gC.m2
+    )
+  ) %>%
+  select(-bd_imputed)
+
+names(cn)
+```
+
+## 6.2  CN data processing
+
+```{r cn-process}
+# Four profiles exempt from C% trimming
+CN_TRIM_EXEMPT <- c("134_C", "360_C", "111_C", "30_A")
+
+cn_filtered <- cn %>%
+  filter(Researcher == "Walker/Mack" | siteplot %in% CN_TRIM_EXEMPT) %>%
+  bind_rows(
+    cn %>%
+      filter(Researcher != "Walker/Mack", !siteplot %in% CN_TRIM_EXEMPT) %>%
+      group_by(siteplot) %>%
+      arrange(soil_depth_top_cm, .by_group = TRUE) %>%
+      mutate(
+        n_samples  = n(),
+        threshold  = if_else(n_samples == 1, 15, 20),
+        last_good  = suppressWarnings(
+                       max(row_number()[C_weight_per >= threshold], na.rm = TRUE)),
+        keep       = is.finite(last_good) & row_number() <= last_good
+      ) %>%
+      filter(keep) %>%
+      select(-last_good, -keep, -n_samples, -threshold) %>%
+      ungroup()
+  )
+
+# Walker/Mack: join on fire+site only
+site_by_fs <- site %>%
+  group_by(fire, site) %>% slice(1) %>% ungroup() %>%
+  dplyr::select(-plot, -siteplot)
+
+cnsite_wm <- filter(cn_filtered, Researcher == "Walker/Mack") %>%
+  left_join(site_by_fs, by = c("fire","site"), suffix = c("", ".site")) %>%
+  mutate(
+    project   = coalesce(project,   project.site),
+    StudyArea = coalesce(StudyArea, StudyArea.site)
+  ) %>%
+  select(-ends_with(".site"))
+
+cnsite_other <- filter(cn_filtered, Researcher != "Walker/Mack") %>%
+  left_join(site, by = c("project","StudyArea","Researcher","fire","site","plot","siteplot"))
+
+cnsite <- bind_rows(cnsite_wm, cnsite_other) %>%
+  group_by(project, Researcher, StudyArea, field_id, fire, site, plot, siteplot) %>%
+  arrange(coalesce(soil_depth_top_cm, soil_depth_bottom_cm, 0), .by_group = TRUE) %>%
+  mutate(
+    cum_from_samples = cumsum(replace_na(sample.depth, 0)),
+    total.depth      = if_else(is.na(sample.depth),
+                               coalesce(soil_depth_bottom_cm, cum_from_samples),
+                               cum_from_samples),
+    prefire.sol      = residualSOL_depth + burn_depth
+  ) %>%
+  ungroup()
+
+# Correct Hung-Natali residual depth
+cnsite <- cnsite %>%
+  mutate(residualSOL_depth = if_else(Researcher == "Hung-Natali",
+                                     total.depth, residualSOL_depth))
+
+# Profiles where ALL samples were removed by C% filter — entire SOL below threshold
+# These get Cpool.tot = 0 from sum(), not NA, so need explicit identification
+all_filtered_siteplots <- cn %>%
+  filter(Researcher != "Walker/Mack", !siteplot %in% CN_TRIM_EXEMPT) %>%
+  group_by(siteplot) %>%
+  summarise(
+    n_with_C  = sum(!is.na(C_weight_per)),
+    n_total    = n(),
+    threshold  = if_else(n() == 1, 15, 20),
+    n_above    = sum(C_weight_per >= if_else(n() == 1, 15, 20), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_above == 0, n_with_C > 0) %>%   # n_with_C > 0 prevents catching Walker sites
+  pull(siteplot)
+
+cat("Profiles with all samples below C% threshold:", length(all_filtered_siteplots), "\n")
+print(all_filtered_siteplots)
+
+# Summarise totals per profile
+CN.tot <- cnsite %>%
+  group_by(project, Researcher, StudyArea, field_id, fire, site, plot, siteplot) %>%
+  summarise(
+    Cpool.tot   = sum(gC.m2,   na.rm = TRUE),
+    Npool.tot   = sum(gN.m2,   na.rm = TRUE),
+    total.depth = if (all(is.na(sample.depth))) max(soil_depth_bottom_cm, na.rm = TRUE)
+                  else sum(sample.depth, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Top and bottom sample densities
+cn_top_bottom <- cnsite %>%
+  group_by(project, Researcher, StudyArea, fire, site, plot, siteplot) %>%
+  summarise(
+    top_C_weight_per    = first(C_weight_per),
+    bottom_C_weight_per = last(C_weight_per),
+    top_sample_depth    = first(sample.depth),
+    bottom_sample_depth = last(sample.depth),
+    top_bd_fine         = first(bd.fine),
+    bottom_bd_fine      = last(bd.fine),
+    top_gC_m2           = first(gC.m2),
+    bottom_gC_m2        = last(gC.m2),
+    mean_bd             = mean(bd.fine,      na.rm = TRUE),
+    mean_C_pct          = mean(C_weight_per, na.rm = TRUE),
+    mean_N_pct          = mean(N_weight_per, na.rm = TRUE),
+    profile_depth       = sum(sample.depth,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(project, Researcher, StudyArea, fire, site, plot, siteplot) %>%
+  summarise(across(top_C_weight_per:profile_depth, ~ first(na.omit(.))),
+            .groups = "drop")
+```
+
+## 6.3  Join CN data; bring in Walker/Mack SOL pools
+
+```{r cn-join}
+CN.all <- LC3 %>%
+  left_join(cn_top_bottom, by = KEYS) %>%
+  left_join(CN.tot %>% filter(Researcher != "Walker/Mack"), by = KEYS) %>%
+  left_join(
+    CN.tot %>%
+      filter(Researcher == "Walker/Mack") %>%
+      group_by(project, StudyArea, fire, site) %>%
+      summarise(across(c(Cpool.tot, Npool.tot, total.depth),
+                       ~ suppressWarnings(max(., na.rm=TRUE))),
+                .groups="drop") %>%
+      rename(Cpool_wm=Cpool.tot, Npool_wm=Npool.tot, depth_wm=total.depth),
+    by = c("project","StudyArea","fire","site")
+  ) %>%
+  mutate(
+    Cpool.tot      = coalesce(Cpool.tot,   Cpool_wm),
+    Npool.tot      = coalesce(Npool.tot,   Npool_wm),
+    total.depth.cn = coalesce(total.depth, depth_wm)
+  ) %>%
+  select(-Cpool_wm, -Npool_wm, -depth_wm, -total.depth)
+
+# Walker/Mack measured SOL pools
+mw_sol <- site_input %>%
+  select(soilID,
+         SOL.C.Combusted_new = SOL.C.Combusted_WM,
+         prefireSOL.C_new    = prefireSOL.C_WM,
+         residualSOL.C_new   = residualSOL.C_WM)
+
+CN.all <- CN.all %>%
+  left_join(mw_sol, by = "soilID") %>%
+  mutate(
+    SOL.C.Combusted = coalesce(SOL.C.Combusted_new, SOL.C.Combusted),
+    prefireSOL.C    = coalesce(prefireSOL.C_new,    prefireSOL.C),
+    residualSOL.C   = coalesce(residualSOL.C_new,   residualSOL.C),
+    Cpool.tot       = if_else(is.na(Cpool.tot), residualSOL.C, Cpool.tot)
+  ) %>%
+  select(-ends_with("_new"))
+
+# New SOL combustion estimates (Diaz-Veraverbeke, Gundale, Metcalfe)
+new_comb <- site_input %>%
+  dplyr::select(soilID, SOL.C.Combusted_new2 = SOL.C.Combusted_profile)
+
+CN.all <- CN.all %>%
+  left_join(new_comb, by = "soilID") %>%
+  mutate(SOL.C.Combusted = coalesce(SOL.C.Combusted, SOL.C.Combusted_new2)) %>%
+  dplyr::select(-SOL.C.Combusted_new2)
+
+
+```
+
+```{r cn-depth-check}
+# ── Trim Cpool.tot to RC bottom depth (whole sample approach) ─────────────────
+# For profiles where total.depth.cn > depth_BOTTOM, the C/N profile extends
+# deeper than the deepest radiocarbon sample. Recompute Cpool.tot per soilID
+# by keeping only samples whose top depth is above depth_BOTTOM.
+# cnsite is still in memory so we can join raw samples back to each soilID.
+# Affects 10 sites (mainly Hung-Natali YKD tundra).
+
+depth_by_soilID <- CN.all %>%
+  select(soilID, siteplot, project, Researcher, StudyArea,
+         fire, site, plot, depth_BOTTOM, total.depth.cn) %>%
+  mutate(
+    # Only trim if CN profile extends >5cm below RC bottom depth.
+    # Within ±5cm is measurement tolerance — leave those untouched.
+    depth_BOTTOM_trim = if_else(
+      !is.na(depth_BOTTOM) & !is.na(total.depth.cn) &
+        (total.depth.cn - depth_BOTTOM) > 5,
+      depth_BOTTOM,
+      NA_real_   # NA = no trim needed
+    )
+  )
+
+Cpool_trimmed <- depth_by_soilID %>%
+  left_join(
+    cnsite %>% select(project, Researcher, StudyArea, fire, site, plot, siteplot,
+                      soil_depth_top_cm, gC.m2, gN.m2),
+    by = c("project","Researcher","StudyArea","fire","site","plot","siteplot")
+  ) %>%
+  filter(is.na(depth_BOTTOM_trim) | soil_depth_top_cm < depth_BOTTOM_trim) %>%
+  group_by(soilID) %>%
+  summarise(
+    n_cn          = sum(!is.na(gC.m2)),
+    Cpool_trimmed = sum(gC.m2, na.rm = TRUE),
+    Npool_trimmed = sum(gN.m2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Profiles with no CN samples keep their existing pool (e.g. Walker/Mack
+  # measured residual SOL C) instead of being set to 0 by an empty sum
+  mutate(
+    Cpool_trimmed = if_else(n_cn > 0, Cpool_trimmed, NA_real_),
+    Npool_trimmed = if_else(n_cn > 0, Npool_trimmed, NA_real_)
+  ) %>%
+  select(-n_cn)
+
+CN.all <- CN.all %>%
+  left_join(Cpool_trimmed, by = "soilID") %>%
+  mutate(
+    Cpool.tot = if_else(!is.na(Cpool_trimmed), Cpool_trimmed, Cpool.tot),
+    Npool.tot = if_else(!is.na(Npool_trimmed), Npool_trimmed, Npool.tot)
+  ) %>%
+  select(-Cpool_trimmed, -Npool_trimmed)
+
+# ── QC: depth alignment check ─────────────────────────────────────────────────
+depth_check <- CN.all %>%
+  mutate(mismatch = depth_BOTTOM - total.depth.cn) %>%
+  filter(!is.na(depth_BOTTOM), !is.na(total.depth.cn)) %>%
+  select(siteplot, soilID, Researcher, StudyArea,
+         depth_BOTTOM, total.depth.cn, mismatch) %>%
+  arrange(desc(mismatch))
+
+cat("Profiles with RC BOTTOM > lab total depth by >5cm:\n")
+depth_check %>% filter(mismatch > 5) %>% as.data.frame() %>% print()
+
+cat("\nProfiles where Cpool.tot was trimmed (CN deeper than RC bottom by >2cm):\n")
+depth_check %>% filter(mismatch < -2) %>%
+  as.data.frame() %>% print()
+
+ggplot(depth_check, aes(x = total.depth.cn, y = depth_BOTTOM, colour = StudyArea)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_abline(slope = 1, intercept = 0,  linetype = "dashed", colour = "grey40") +
+  geom_abline(slope = 1, intercept = 5,  linetype = "dotted", colour = "red", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = -5, linetype = "dotted", colour = "red", alpha = 0.6) +
+  labs(x = "Lab total depth (cm)", y = "RC BOTTOM sample depth (cm)",
+       title = "RC bottom depth vs lab-derived SOL depth",
+       subtitle = "Red dotted lines = ±5 cm tolerance") +
+  theme_lcc()
+
+CN.all %>%
+  filter(soilID %in% c("YKD B-2", "YKD B-3", "YKD B-6", "YKD B-9")) %>%
+  select(soilID, depth_BOTTOM, total.depth.cn, Cpool.tot)
+
+CN.all <- CN.all %>%
+  mutate(
+    total.depth.cn_trimmed = if_else(
+      !is.na(depth_BOTTOM) & (total.depth.cn - depth_BOTTOM) > 5,
+      depth_BOTTOM,
+      total.depth.cn
+    )
+  )
+
+```
+
+## 6.4  Filter age inversions
+
+```{r cn-filter-inversions}
+# A profile is excluded as inverted only if BOTTOM is younger than TOP: those
+# two dates define the profile's age span and legacy C. Inversions involving
+# MID are tolerated, because MID enters only through abs(TOP - MID) in 6.5.
+CN.all.orig <- CN.all %>%
+  mutate(
+    age_inversion = coalesce(calendar_year_median_TOP < calendar_year_median_BOTTOM, FALSE),
+    mid_inversion = coalesce(calendar_year_median_TOP < calendar_year_median_MID, FALSE) |
+                    coalesce(calendar_year_median_MID < calendar_year_median_BOTTOM, FALSE),
+    # Inverted profiles whose dates ALL fall on one side of stand origin (year):
+    # the residual SOL is entirely legacy C (all dates older than stand origin)
+    # or entirely new C (all dates younger), whatever the order of the dates,
+    # so these are kept. Because the dates are out of order, the youngest dated
+    # sample is treated as the residual surface and the oldest as the base:
+    # residual years = youngest - oldest date, combusted years = fire year -
+    # youngest date, prefire years = fire year - oldest date (as for ordered
+    # profiles, where these are TOP and BOTTOM). Accumulation rates are set to
+    # NA because the age-depth order is unknown.
+    date_max = pmax(calendar_year_median_TOP, calendar_year_median_MID,
+                    calendar_year_median_BOTTOM, na.rm = TRUE),
+    date_min = pmin(calendar_year_median_TOP, calendar_year_median_MID,
+                    calendar_year_median_BOTTOM, na.rm = TRUE),
+    inversion_retained = age_inversion &
+      coalesce(date_max < year | date_min > year, FALSE),
+    inversion_all_legacy = inversion_retained & coalesce(date_max < year, FALSE)
+  )
+
+CN.all.orig <- CN.all.orig %>%
+   mutate(rising_spread = soilID %in% spread_cores,
+          top_from_mid  = soilID %in% top_from_mid_cores)
+
+cat("Profiles with a MID inversion (kept):", sum(CN.all.orig$mid_inversion & !CN.all.orig$age_inversion), "\n")
+
+removed <- CN.all.orig %>%
+  filter(age_inversion) %>%
+  select(siteplot, StudyArea, Researcher,
+         calendar_year_median_TOP, calendar_year_median_BOTTOM,
+         stand_age, ForestType) %>%
+  arrange(StudyArea, siteplot) %>%
+  mutate(inversion_magnitude = calendar_year_median_BOTTOM - calendar_year_median_TOP)
+
+cat("Profiles with age inversion:", nrow(removed), "\n")
+as.data.frame(removed %>% arrange(inversion_magnitude))
+
+# No dates are swapped between samples; all inverted profiles are excluded
+# via exclusion_reason in section 6.5.1.
+CN.all <- CN.all.orig
+
+cat("Profiles with age inversion:", sum(CN.all$age_inversion, na.rm = TRUE), "\n")
+cat("  retained (all dates on one side of stand origin):", sum(CN.all$inversion_retained, na.rm = TRUE), "\n")
+cat("  excluded:", sum(CN.all$age_inversion & !CN.all$inversion_retained, na.rm = TRUE), "\n")
+CN.all %>% filter(inversion_retained) %>%
+  select(soilID, year, inversion_all_legacy, calendar_year_median_TOP,
+         calendar_year_median_MID, calendar_year_median_BOTTOM)
+```
+
+
+## 6.5  C accumulation rates and combustion estimates
+
+```{r cn-rates-estimates}
+# Impute burn_depth = 0 to 1 cm minimum
+CN.all <- CN.all %>%
+  mutate(burn_depth = ifelse(burn_depth == 0, 1, burn_depth))
+
+CN.all <- CN.all %>%
+  mutate(
+    # ── Years ────────────────────────────────────────────────────────────────
+    # Retained inversions (6.4): youngest date = residual surface, oldest = base
+    total_years             = if_else(inversion_retained,
+                                      date_max - date_min,
+                                      abs(calendar_year_median_TOP - calendar_year_median_BOTTOM)),
+    age_span_years_burned   = if_else(inversion_retained,
+                                      Year_of_Burn - date_max,
+                                      abs(Year_of_Burn - calendar_year_median_TOP)),
+    age_span_years_top      = if_else(inversion_retained, NA_real_,
+                                      pmax(abs(calendar_year_median_TOP - calendar_year_median_MID), 1)),
+
+    # ── Age–depth gradients ──────────────────────────────────────────────────
+    years_per_cm_profile = if_else(inversion_retained, NA_real_,
+                                   safe_div(total_years, total.depth.cn_trimmed)),
+    years_per_cm_used    = coalesce(age_span_years_top, years_per_cm_profile),
+    years_removed_by_burn = pmin(burn_depth * years_per_cm_used, age_span_years_burned),
+
+    # ── Accumulation rates (g C m⁻² yr⁻¹) ───────────────────────────────────
+    C_accumulation_rate_residual   = if_else(inversion_retained, NA_real_,
+                                             safe_div(Cpool.tot, total_years)),
+    C_density_mean_per_cm          = safe_div(Cpool.tot,    total.depth.cn_trimmed),
+    C_density_top_per_cm           = safe_div(top_gC_m2,   top_sample_depth),
+    C_pool_top_1                   = C_density_top_per_cm * 1,
+    C_accumulation_rate_top        = safe_div(C_pool_top_1, age_span_years_top),
+    C_accumulation_rate_years_final = pmin(C_accumulation_rate_top,
+                                           C_accumulation_rate_residual, na.rm = TRUE),
+
+    # ── SOL C combustion estimates (kept for diagnostics/supplementary) ───────
+    SOL.C.Combusted_profile_depth = C_density_mean_per_cm * burn_depth,
+    SOL.C.Combusted_top_depth     = C_density_top_per_cm  * burn_depth,
+    SOL.C.Combusted_profile_years = C_accumulation_rate_residual * age_span_years_burned,
+    SOL.C.Combusted_top_years     = C_accumulation_rate_top      * age_span_years_burned,
+
+    # ── Prefire SOL depth ────────────────────────────────────────────────────
+    prefire.sol = total.depth.cn_trimmed + burn_depth
+  )
+
+```
+
+```{r cn-rates-model}
+# Calibration model for sites missing measured SOL.C.Combusted
+cal_dat <- CN.all %>%
+  filter(!soilID %in% ARCHIVE_ONLY_SOILIDS,
+         !is.na(burn_depth), !is.na(SOL.C.Combusted),
+         !is.na(Moisture_Class), burn_depth > 0, SOL.C.Combusted > 0) %>%
+  mutate(Moisture_3 = factor(Moisture_3, levels = c("dry", "moist", "wet"))) %>%   # from site file
+  filter(!is.na(Moisture_3))
+
+cat("Calibration model n:", nrow(cal_dat), "\n")
+
+m_comb_cal <- glmmTMB(
+  SOL.C.Combusted ~ burn_depth + I(burn_depth^2) + Moisture_3 + (1|StudyArea),
+  family = Gamma(link = "log"),
+  data   = cal_dat
+)
+summary(m_comb_cal)
+
+# Moisture_3 for prediction (from the site file)
+CN.all <- CN.all %>%
+  mutate(Moisture_3 = factor(Moisture_3, levels = c("dry", "moist", "wet")))
+
+# Predict into all sites
+CN.all$SOL.C.Combusted_modelled <- NA_real_
+has_predictors <- !is.na(CN.all$burn_depth) & !is.na(CN.all$Moisture_3)
+CN.all$SOL.C.Combusted_modelled[has_predictors] <- predict(
+  m_comb_cal, newdata = CN.all[has_predictors, ],
+  type = "response", allow.new.levels = TRUE
+)
+
+# Final combustion estimate and source tracking
+CN.all <- CN.all %>%
+  mutate(
+    SOL.C.Combusted_final = coalesce(SOL.C.Combusted,
+                                     SOL.C.Combusted_modelled,
+                                     SOL.C.Combusted_top_depth,
+                                     SOL.C.Combusted_profile_depth,
+                                     SOL.C.Combusted_profile_years),
+    SOL.C.Combusted_source = case_when(
+      !is.na(SOL.C.Combusted)               ~ "field measured",
+      !is.na(SOL.C.Combusted_modelled)      ~ "modelled",
+      !is.na(SOL.C.Combusted_top_depth)     ~ "top depth",
+      !is.na(SOL.C.Combusted_profile_depth) ~ "profile depth",
+      !is.na(SOL.C.Combusted_profile_years) ~ "profile years",
+      TRUE                                  ~ "missing"
+    )
+  )
+
+cat("SOL.C.Combusted source breakdown:\n")
+print(CN.all %>% count(SOL.C.Combusted_source))
+
+# Impute burn_depth for sites missing it but with SOL.C.Combusted_final
+CN.all <- CN.all %>%
+  mutate(
+    burn_depth_imputed = is.na(burn_depth) &
+                         !is.na(SOL.C.Combusted_final) &
+                         !is.na(C_density_mean_per_cm),
+    burn_depth = case_when(
+      !is.na(burn_depth) ~ burn_depth,
+      burn_depth_imputed ~ SOL.C.Combusted_final / C_density_mean_per_cm,
+      TRUE               ~ NA_real_
+    )
+  )
+
+cat("Sites with imputed burn_depth:", sum(CN.all$burn_depth_imputed, na.rm = TRUE), "\n")
+cat("Sites still missing burn_depth:", sum(is.na(CN.all$burn_depth)), "\n")
+
+```
+
+## 6.5.1  Exclusion flags (no filtering — all profiles retained for archive)
+
+```{r cn-exclusion-flags}
+CN.all <- CN.all %>%
+  mutate(
+    exclusion_reason = case_when(
+      # Archived but not used in the manuscript (archive_only in site file)
+      soilID %in% ARCHIVE_ONLY_SOILIDS                             ~ "not_in_manuscript",
+      # Insufficient C is checked first: these profiles are not organic SOL,
+      # so their dates are not used regardless of order
+      siteplot %in% all_filtered_siteplots                         ~ "insufficient_C_concentration",
+      # Age inversion (see 6.4)
+      age_inversion & !inversion_retained                          ~ "age_inversion",
+      # Missing residual C pool
+      is.na(Cpool.tot)                                             ~ "missing_residual_C",
+      # Missing surface radiocarbon date
+      is.na(calendar_year_median_TOP)                              ~ "missing_RC_surface",
+      # Missing basal radiocarbon date (neither BOTTOM nor MID)
+      is.na(calendar_year_median_BOTTOM) &
+        is.na(calendar_year_median_MID)                            ~ "missing_RC_basal",
+      # Included
+      TRUE                                                         ~ NA_character_
+    ),
+    included_in_analysis = is.na(exclusion_reason)
+  )
+
+
+MAX_MEASURED_BD <- max(CN.all$burn_depth[!CN.all$burn_depth_imputed &
+                                          !CN.all$soilID %in% ARCHIVE_ONLY_SOILIDS],
+                       na.rm = TRUE)
+
+CN.all <- CN.all %>%
+  mutate(
+    exclusion_reason = if_else(
+      is.na(exclusion_reason) & burn_depth_imputed & burn_depth > MAX_MEASURED_BD,
+      "combustion_outlier", exclusion_reason),
+    included_in_analysis = is.na(exclusion_reason)
+  )
+
+
+cat("Total profiles in archive:", nrow(CN.all), "\n")
+cat("Included in analysis:     ", sum(CN.all$included_in_analysis), "\n\n")
+cat("Exclusion reasons:\n")
+print(CN.all %>% count(exclusion_reason, sort = TRUE))
+```
+
+## 6.6  Legacy C partitioning
+
+```{r legacy-partition}
+CN.all <- CN.all %>%
+  mutate(
+    # Years of legacy C in residual SOL
+    # Retained inversions: residual years are all legacy or all new
+    legacy_years = if_else(inversion_retained,
+                           if_else(inversion_all_legacy, total_years, 0), pmax(
+      pmin(year, calendar_year_median_TOP) - calendar_year_median_BOTTOM,
+      0, na.rm = TRUE
+    )),
+    # If TOP and BOTTOM have the same age (total_years = 0, e.g. rule 1d in a
+    # two-sample core), the dated residual SOL is a single age: all legacy if
+    # that age predates stand origin, none if it does not.
+    legacy_frac = case_when(
+      inversion_retained ~ as.numeric(inversion_all_legacy),   # 1 = all older than stand origin, 0 = all younger
+      total_years %in% 0 & !is.na(calendar_year_median_BOTTOM) & !is.na(year) ~
+        as.numeric(calendar_year_median_BOTTOM < year),
+      TRUE ~ safe_div(legacy_years, total_years)
+    ),
+    legacy_C    = if_else(is.finite(legacy_frac), Cpool.tot * legacy_frac,       NA_real_),
+    new_C       = if_else(is.finite(legacy_frac), Cpool.tot * (1 - legacy_frac), NA_real_),
+
+    # Legacy combustion
+    combustion_years         = age_span_years_burned,
+    new_years_combusted      = pmin(combustion_years, stand_age),
+    legacy_combustion_years  = pmin(pmax(combustion_years - stand_age, 0), combustion_years),
+
+    prop.leg = case_when(
+      is.na(combustion_years) | combustion_years == 0 ~ 0,
+      TRUE ~ safe_div(legacy_combustion_years, combustion_years)
+    ),
+
+    legacy_combustion_C_final = prop.leg * SOL.C.Combusted_final,
+    new_C_combusted           = SOL.C.Combusted_final - legacy_combustion_C_final
+  )
+```
+
+
+---
+
+# 6.7  Canonical StudyArea names
+
+```{r studyarea-rename}
+CN.all <- CN.all %>%
+  mutate(
+    StudyArea = case_when(
+      StudyArea == "Alaska" ~ "AK boreal",
+      StudyArea == "Kenai"  ~ "AK maritime",
+      TRUE ~ StudyArea
+    ),
+    StudyArea = factor(StudyArea, levels = STUDY_AREA_LEVELS)
+  )
+
+cat("StudyArea counts:\n")
+print(table(CN.all$StudyArea, useNA = "ifany"))
+```
+
+---
+
+# 6.8  ForestGroup (from site file)
+
+```{r forestgroup}
+# ForestGroup now comes from the site file (LCC_build_site_input.Rmd)
+CN.all <- CN.all %>%
+  mutate(ForestGroup = factor(ForestGroup,
+                              levels = c("Black spruce", "Other conifer",
+                                         "Deciduous/Mixed", "Tundra / Non-forested")))
+
+cat("ForestGroup counts:\n")
+print(table(CN.all$ForestGroup, useNA = "ifany"))
+```
+
+---
+
+```{r}
+CN.all %>%
+  filter(soilID %in% (radio %>% filter(Section_new %in% c("TOP","MID","BOTTOM")) %>%
+                        distinct(soilID, Section_new) %>% count(soilID) %>%
+                        filter(n == 2) %>% pull(soilID)),
+         !soilID %in% RELABEL_MID_TO_BOTTOM) %>%
+  select(soilID, calendar_year_median_TOP, calendar_year_median_MID,
+         calendar_year_median_BOTTOM, total_years, included_in_analysis) %>%
+  print(n = 40)
+```
+
+
+# 6.9  Spatial data join (MAT, MAP, tree cover, coordinates)
+
+```{r spatial-join}
+
+# MAT, MAP and tree cover from the site-level input file
+CN.all <- CN.all %>%
+  mutate(site = as.character(site), fire = as.character(fire)) %>%
+  rename(Lat_orig = Latitude, Lon_orig = Longitude) %>%        # protect
+  left_join(site_input %>% select(soilID, MAT_s = MAT, MAP_s = MAP, tree_cover_s = tree_cover),
+            by = "soilID") %>%
+  mutate(
+    MAT        = MAT_s,
+    MAP        = MAP_s,
+    tree_cover = tree_cover_s,
+    Latitude   = Lat_orig,                                      # restore
+    Longitude  = Lon_orig
+  ) %>%
+  select(-MAT_s, -MAP_s, -tree_cover_s, -Lat_orig, -Lon_orig)
+
+
+cat("MAT coverage:", sum(!is.na(CN.all$MAT)), "/", nrow(CN.all), "\n")
+cat("Sites missing spatial data:\n")
+CN.all %>% filter(is.na(MAT)) %>%
+  count(Researcher, StudyArea) %>% as.data.frame() %>% print()
+```
+
+---
+
+# 6.10  prefire_depth, BS_Position, and Eco (8-level)
+
+```{r eco-classification}
+CN.all <- CN.all %>%
+  mutate(
+    # ── Prefire SOL depth ────────────────────────────────────────────────────
+    prefire_depth = coalesce(depth_BOTTOM, total.depth.cn_trimmed, residualSOL_depth) + burn_depth,
+
+    # ── Upland / Lowland position for black spruce ───────────────────────────
+    # Threshold: prefire SOL >= 20 cm = Lowland; < 20 cm = Upland
+    BS_Position = case_when(
+      # AK boreal Other conifer treated as black spruce for this classification
+      StudyArea == "AK boreal" & ForestGroup == "Other conifer" & prefire_depth >= 20 ~ "Lowland",
+      StudyArea == "AK boreal" & ForestGroup == "Other conifer" & prefire_depth  < 20 ~ "Upland",
+      StudyArea == "AK boreal" & ForestGroup == "Other conifer" & is.na(prefire_depth)~ "Upland",
+      # Standard BS rules
+      ForestGroup == "Black spruce" & prefire_depth >= 20 ~ "Lowland",
+      ForestGroup == "Black spruce" & prefire_depth  < 20 ~ "Upland",
+      # Fallback rules for missing prefire_depth
+      StudyArea == "Yukon"     & ForestGroup == "Black spruce" & is.na(prefire_depth) ~ "Upland",
+      StudyArea == "NWT"       & ForestGroup == "Black spruce" & is.na(prefire_depth) ~ "Lowland",
+      StudyArea == "AK boreal" & ForestGroup == "Black spruce" & is.na(prefire_depth) ~ "Upland",
+      TRUE ~ NA_character_
+    ),
+
+    # ── Full 8-level ecosystem classification ─────────────────────────────────
+    # Factor level order is drainage-first (dry → wet)
+    Eco = case_when(
+      # Profile-specific overrides from the site file (LCC_build_site_input.Rmd)
+      !is.na(Eco_override) ~ as.character(Eco_override),
+      # Siteplot-specific overrides
+      siteplot == "36_1" ~ "Western NA Mixed/Deciduous",
+      siteplot == "21_C" ~ "Western NA Upland Spruce",
+      # Tundra
+      ForestGroup == "Tundra / Non-forested"                                          ~ "Western NA Tundra",
+      # Sweden
+      StudyArea == "Sweden"                                                            ~ "Scandinavian Pine",
+      # Deciduous/Mixed
+      ForestGroup == "Deciduous/Mixed"                                                 ~ "Western NA Mixed/Deciduous",
+      # Maritime black spruce (AK maritime and NL)
+      StudyArea %in% c("AK maritime", "NL") & ForestGroup == "Black spruce"           ~ "Maritime NA Spruce",
+      # Western black spruce — Upland
+      StudyArea %in% c("AK boreal", "Yukon", "NWT") &
+        ForestGroup %in% c("Black spruce", "Other conifer") &
+        BS_Position == "Upland"                                                        ~ "Western NA Upland Spruce",
+      # Western black spruce — Lowland
+      StudyArea %in% c("AK boreal", "Yukon", "NWT") &
+        ForestGroup %in% c("Black spruce", "Other conifer") &
+        BS_Position == "Lowland"                                                       ~ "Western NA Lowland Spruce",
+      # Eastern black spruce — Upland
+      StudyArea == "Quebec" & ForestGroup == "Black spruce" & BS_Position == "Upland" ~ "Eastern NA Upland Spruce",
+      # Eastern black spruce — Lowland
+      StudyArea == "Quebec" & ForestGroup == "Black spruce" & BS_Position == "Lowland"~ "Eastern NA Lowland Spruce",
+      TRUE ~ NA_character_
+    ),
+    Eco = factor(Eco, levels = c(
+      "Scandinavian Pine",
+      "Western NA Mixed/Deciduous",
+      "Maritime NA Spruce",
+      "Western NA Upland Spruce",
+      "Eastern NA Upland Spruce",
+      "Western NA Lowland Spruce",
+      "Eastern NA Lowland Spruce",
+      "Western NA Tundra"
+    ))
+  )
+
+cat("Eco counts:\n")
+print(table(CN.all$Eco, useNA = "ifany"))
+cat("Unclassified (check ForestGroup / BS_Position):\n")
+CN.all %>% filter(is.na(Eco)) %>%
+  count(Researcher, StudyArea, ForestGroup, BS_Position) %>%
+  as.data.frame() %>% print()
+```
+
+---
+
+# 6.11  Dom_species (from site file)
+
+```{r dom-species}
+# Dom_species now comes from the site file (LCC_build_site_input.Rmd)
+cat("Dom_species unclassified:", sum(is.na(CN.all$Dom_species)), "\n")
+```
+
+
+---
+
+# 6.12  Final C pool variables (prefire / residual / combusted)
+
+```{r final-cpools}
+CN.all <- CN.all %>%
+  mutate(
+    # ── Prefire = residual + combusted ────────────────────────────────────────
+    prefire_legacy_C  = legacy_C + legacy_combustion_C_final,
+    prefire_new_C     = new_C + (SOL.C.Combusted_final - legacy_combustion_C_final),
+    prefire_total_C   = prefire_legacy_C + prefire_new_C,
+    prefire_legacy_yr = legacy_years + legacy_combustion_years,
+    prefire_new_yr    = (total_years - legacy_years) +
+                        (combustion_years - legacy_combustion_years),
+    prefire_total_yr  = prefire_legacy_yr + prefire_new_yr,
+
+    # ── Residual ──────────────────────────────────────────────────────────────
+    resid_legacy_C  = legacy_C,
+    resid_new_C     = new_C,
+    resid_total_C   = resid_legacy_C + resid_new_C,    # == Cpool.tot
+    resid_legacy_yr = legacy_years,
+    resid_new_yr    = total_years - legacy_years,
+    resid_total_yr  = total_years,
+
+    # ── Combusted ─────────────────────────────────────────────────────────────
+    comb_legacy_C  = legacy_combustion_C_final,
+    comb_new_C     = SOL.C.Combusted_final - legacy_combustion_C_final,
+    comb_total_C   = SOL.C.Combusted_final,
+    comb_legacy_yr = legacy_combustion_years,
+    comb_new_yr    = combustion_years - legacy_combustion_years,
+    comb_total_yr  = combustion_years,
+
+    # ── Proportions (clamped to avoid 0/1 boundary issues in beta models) ────
+    prop_pre_leg_C   = pmin(pmax(safe_div(prefire_legacy_C,  prefire_total_C),  1e-6), 1-1e-6),
+    prop_comb_leg_C  = pmin(pmax(safe_div(comb_legacy_C,     comb_total_C),     1e-6), 1-1e-6),
+    prop_resid_leg_C = pmin(pmax(safe_div(resid_legacy_C,    resid_total_C),    1e-6), 1-1e-6),
+
+    # ── Legacy C flags ────────────────────────────────────────────────────────
+    LC_prefire   = prefire_legacy_C > 0,
+    LC_resid     = resid_legacy_C   > 0,
+    LC_combusted = comb_legacy_yr    > 0,
+    LC_resid_bin = as.integer(LC_resid),
+    LC_comb_bin  = as.integer(LC_combusted)
+  )
+```
+
+---
+
+# 6.13  Factor levels and BurnDepth_Class
+
+```{r factor-vars}
+CN.all <- CN.all %>%
+  mutate(
+    # Canonical 6-level ordered factor (submesic replaces mesic-subxeric)
+    # Moisture_Class, Moisture_3 and AgeClass come from the site file
+    Moisture_Class = factor(Moisture_Class,
+                            levels = c("xeric","subxeric","submesic",
+                                       "mesic","mesic-subhygric","subhygric"),
+                            ordered = TRUE),
+    Moisture_3 = factor(Moisture_3, levels = c("dry","moist","wet")),
+    AgeClass   = factor(AgeClass, levels = c("Short (<30 yr)","Mid (30-70 yr)","Long (>70 yr)")),
+
+    BurnDepth_Class = case_when(
+      burn_depth < 5              ~ "Shallow (<5 cm)",
+      between(burn_depth, 5, 10)  ~ "Moderate (5-10 cm)",
+      burn_depth > 10             ~ "Deep (>10 cm)",
+      TRUE                        ~ NA_character_
+    ),
+    BurnDepth_Class = factor(BurnDepth_Class,
+                             levels = c("Shallow (<5 cm)","Moderate (5-10 cm)","Deep (>10 cm)"))
+  )
+```
+
+---
+
+
+# 7  Write archive file
+
+```{r write-archive}
+CN.all <- CN.all %>%
+  mutate(
+    Longitude = if_else(
+      StudyArea != "Sweden" & !is.na(Longitude) & Longitude > 0,
+      -Longitude,
+      Longitude
+    )
+  )
+
+
+# ── Final QC before writing ────────────────────────────────────────────────────
+cat("Final sample size:", nrow(CN.all), "\n\n")
+cat("StudyArea:\n"); print(table(CN.all$StudyArea, useNA = "ifany"))
+cat("\nEco:\n");     print(table(CN.all$Eco,        useNA = "ifany"))
+cat("\nForestGroup:\n"); print(table(CN.all$ForestGroup, useNA = "ifany"))
+cat("\nLC flags (resid / combusted):\n")
+print(table(LC_resid = CN.all$LC_resid, LC_combusted = CN.all$LC_combusted, useNA = "ifany"))
+
+# ── Select archive columns ─────────────────────────────────────────────────────
+# Intermediate combustion variants (SOL.C.Combusted_profile_*, _modelled, etc.)
+# and old flag names (LC.present, legacyCpresent.num) are intentionally excluded.
+
+archive_cols <- c(
+  # --- Identification ---
+  "Researcher", "StudyArea",
+  "fire", "site", "plot", "project", "siteplot", "field_id", "soilID",
+  # --- Site characteristics ---
+  "Year_of_Burn", "stand_age", "stand_age_imputed", "age_method",
+  "Latitude", "Longitude", "Coordinate_Reference_System..projection.or.EPSG.",
+  "Slope", "Aspect", "Elevation",
+  "MAT", "MAP", "tree_cover",
+  # --- Vegetation ---
+  "ForestType", "Eco_Type", "ForestGroup", "Eco", "BS_Position", "Dom_species",
+  # --- Fire / SOL structure ---
+  "burn_depth", "BurnDepth_Class", "Burn_depth_method", "residualSOL_depth", "prefire_depth",
+  "total.depth.cn", "total.depth.cn_trimmed", "Thaw_depth", "reburn_class_final",
+  # --- SOL properties ---
+  "mean_bd", "mean_C_pct", "mean_N_pct", "profile_depth",
+  "Moisture_Class", "Moisture_3", "AgeClass",
+  # --- SOL combustion (final values only) ---
+  "SOL.C.Combusted_final", "SOL.C.Combusted_source",
+  # --- Radiocarbon ages ---
+  "calendar_year_median_TOP", "calendar_year_median_MID", "calendar_year_median_BOTTOM",
+  "F14C_TOP", "F14C_MID", "F14C_BOTTOM",
+  "X14C_TOP", "X14C_MID", "X14C_BOTTOM",
+  "depth_TOP", "depth_MID", "depth_BOTTOM",
+  # --- C pools — core ---
+  "Cpool.tot", "Npool.tot", "prefireSOL.C",
+  # --- Legacy C — prefire ---
+  "prefire_legacy_C", "prefire_new_C", "prefire_total_C",
+  "prefire_legacy_yr", "prefire_new_yr", "prefire_total_yr",
+  # --- Legacy C — residual ---
+  "resid_legacy_C", "resid_new_C", "resid_total_C",
+  "resid_legacy_yr", "resid_new_yr", "resid_total_yr",
+  # --- Legacy C — combusted ---
+  "comb_legacy_C", "comb_new_C", "comb_total_C",
+  "comb_legacy_yr", "comb_new_yr", "comb_total_yr",
+  # --- Exclusion flags ---
+  "exclusion_reason", "included_in_analysis",
+  # --- Quality flags ---
+  "age_inversion", "inversion_retained", "inversion_all_legacy", "mid_inversion", "rising_spread", "top_from_mid", "burn_depth_imputed",
+  # --- Flags and proportions ---
+  "LC_prefire", "LC_resid", "LC_combusted",
+  "LC_resid_bin", "LC_comb_bin",
+  "prop.leg", "prop_pre_leg_C", "prop_comb_leg_C", "prop_resid_leg_C",
+  # --- Accumulation rate diagnostics ---
+  "C_accumulation_rate_residual", "C_density_mean_per_cm",
+  "C_accumulation_rate_top", "C_density_top_per_cm",
+  "years_per_cm_profile", "total_years"
+)
+
+# Columns left out of the published archive (and its dictionary).
+# Duplicates and intermediates: not needed to reproduce any reported value.
+ARCHIVE_DROP_REDUNDANT <- c(
+  "Cpool.tot",                     # identical to resid_total_C
+  "total_years",                   # identical to resid_total_yr
+  "prop.leg",                      # = comb_legacy_yr / comb_total_yr (unclamped)
+  "prop_pre_leg_C", "prop_comb_leg_C", "prop_resid_leg_C",   # clamped copies for beta models (not used)
+  "C_accumulation_rate_top", "C_density_top_per_cm",         # intermediate combustion variants
+  "years_per_cm_profile",
+  "total.depth.cn",                # untrimmed lab depth; total.depth.cn_trimmed is the one used
+  "Coordinate_Reference_System..projection.or.EPSG."         # empty for all profiles
+)
+# Site descriptors not used in any calculation or figure (sparse for some studies).
+# Empty this vector to keep them.
+ARCHIVE_DROP_UNUSED <- c("reburn_class_final")
+archive_cols <- setdiff(archive_cols, c(ARCHIVE_DROP_REDUNDANT, ARCHIVE_DROP_UNUSED))
+
+# F14C by sample position (the measured quantity used for dating), joined by soilID
+f14c_wide <- rc_age %>%
+  filter(Section_new %in% c("TOP", "MID", "BOTTOM"), !is.na(X14C)) %>%   # same samples as X14C (e.g. Sweden 41 MID/BOTTOM set to NA in 5.5)
+  group_by(soilID, Section_new) %>%
+  summarise(F14C = mean(F14C, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Section_new, values_from = F14C, names_prefix = "F14C_")
+
+CN.all <- CN.all %>%
+  select(-any_of(c("F14C_TOP", "F14C_MID", "F14C_BOTTOM"))) %>%
+  left_join(f14c_wide, by = "soilID")
+
+CN_archive <- CN.all %>%
+  select(any_of(archive_cols)) %>%
+  # restore NWT siteplot (left empty for the CN joins); for NWT, siteplot = soilID
+  mutate(siteplot = if_else(is.na(siteplot) & Researcher == "Walker/Mack", soilID, siteplot))
+
+# Check for expected columns that are missing (likely a pipeline name change)
+missing_cols <- setdiff(archive_cols, names(CN_archive))
+if (length(missing_cols) > 0)
+  stop("Expected archive columns not found (did every section in 6 run?): ",
+       paste(missing_cols, collapse = ", "))
+
+write_csv(CN_archive, "LCC_LegacyCarbon_archive_new9.csv")
+cat("Final archive:", nrow(CN_archive), "rows,", ncol(CN_archive), "columns\n")
+cat("  Included in analysis:  ", sum(CN_archive$included_in_analysis, na.rm = TRUE), "\n")
+cat("  Excluded (flagged):    ", sum(!CN_archive$included_in_analysis, na.rm = TRUE), "\n\n")
+cat("Exclusion breakdown:\n")
+print(CN_archive %>% count(exclusion_reason, sort = TRUE))
+cat("\nOutput: LCC_LegacyCarbon_archive.csv\n")
+```
+
+
+```{r write-data-dictionary}
+# ── Data dictionary ──────────────────────────────────────────────────────────
+data_dictionary <- tribble(
+  ~column,                       ~group,                ~units,               ~description,
+  # --- Identification ---
+  "Researcher",                  "Identification",      "",                   "Research group (harmonized name)",
+  "StudyArea",                   "Identification",      "",                   "Circumpolar region: AK boreal, AK tundra, AK maritime, Yukon, NWT, Quebec, NL, Sweden",
+  "fire",                        "Identification",      "",                   "Fire event identifier (Walker and Walker/Mack only)",
+  "site",                        "Identification",      "",                   "Site identifier",
+  "plot",                        "Identification",      "",                   "Plot identifier within site",
+  "project",                     "Identification",      "",                   "Source project code (LC, LCC, NWT)",
+  "siteplot",                    "Identification",      "",                   "Site-plot identifier used to join site, C/N and radiocarbon data",
+  "field_id",                    "Identification",      "",                   "Original field identifier assigned by the contributing researcher",
+  "soilID",                      "Identification",      "",                   "Unique soil profile (radiocarbon core) identifier",
+  # --- Site characteristics ---
+  "Year_of_Burn",                "Site",                "calendar year CE",   "Year of the most recent fire",
+  "stand_age",                   "Site",                "yr",                 "Fire-free interval before the most recent fire. Imputed values are flagged in stand_age_imputed",
+  "stand_age_imputed",           "Site",                "",                   "Imputation flag: imputed_100, imputed_250, or NA (measured)",
+  "age_method",                  "Site",                "",                   "Method used to determine stand age",
+  "Latitude",                    "Site",                "decimal degrees",    "Site latitude (north positive)",
+  "Longitude",                   "Site",                "decimal degrees",    "Site longitude (east positive, west negative)",
+  "Slope",                       "Site",                "degrees",            "Terrain slope",
+  "Aspect",                      "Site",                "degrees",            "Terrain aspect",
+  "Elevation",                   "Site",                "m a.s.l.",           "Site elevation",
+  "MAT",                         "Site",                "degrees C",          "Mean annual temperature (30-yr normal from spatial data). NA for Walker/Mack NWT",
+  "MAP",                         "Site",                "mm",                 "Mean annual precipitation (30-yr normal from spatial data). NA for Walker/Mack NWT",
+  "tree_cover",                  "Site",                "%",                  "Canopy tree cover from remote sensing. NA for Walker/Mack NWT",
+  # --- Vegetation ---
+  "ForestType",                  "Vegetation",          "",                   "Dominant tree/vegetation type as recorded in the field. Primary input to ForestGroup",
+  "Eco_Type",                    "Vegetation",          "",                   "Broader vegetation description. Input to ForestGroup where ForestType is blank",
+  "ForestGroup",                 "Vegetation",          "",                   "Vegetation group derived from ForestType/Eco_Type: Black spruce, Other conifer, Deciduous/Mixed, Tundra / Non-forested",
+  "Eco",                         "Vegetation",          "",                   "Ecosystem class (8 levels) from ForestGroup, StudyArea and BS_Position, with profile-level overrides from the site file",
+  "BS_Position",                 "Vegetation",          "",                   "Upland / Lowland for black spruce (and AK boreal other conifer): Lowland if prefire_depth >= 20 cm",
+  "Dom_species",                 "Vegetation",          "",                   "Dominant tree species (Latin binomial)",
+  # --- Fire / SOL structure ---
+  "burn_depth",                  "Fire / SOL",          "cm",                 "Depth of SOL consumed by fire. Field-measured unless burn_depth_imputed is TRUE; recorded zeros set to 1 cm",
+  "BurnDepth_Class",             "Fire / SOL",          "",                   "Burn depth class: Shallow (<5 cm), Moderate (5-10 cm), Deep (>10 cm)",
+  "Burn_depth_method",           "Fire / SOL",          "",                   "Method used to measure burn depth (LCC sites only)",
+  "residualSOL_depth",           "Fire / SOL",          "cm",                 "Field-measured residual SOL depth after fire",
+  "prefire_depth",               "Fire / SOL",          "cm",                 "Reconstructed prefire SOL depth = (depth_BOTTOM, else total.depth.cn_trimmed, else residualSOL_depth) + burn_depth",
+  "total.depth.cn_trimmed",      "Fire / SOL",          "cm",                 "Depth of the residual C/N profile used for all C pool calculations; trimmed to depth_BOTTOM where the C/N profile extends >5 cm below the basal radiocarbon sample",
+  "Thaw_depth",                  "Fire / SOL",          "cm",                 "Active layer / thaw depth at time of sampling",
+  # --- SOL properties ---
+  "mean_bd",                     "SOL properties",      "g cm-3",             "Mean bulk density across the residual C/N profile",
+  "mean_C_pct",                  "SOL properties",      "%",                  "Mean C concentration across the residual C/N profile",
+  "mean_N_pct",                  "SOL properties",      "%",                  "Mean N concentration across the residual C/N profile",
+  "profile_depth",               "SOL properties",      "cm",                 "Total depth of the C/N profile (sum of sample depths)",
+  "Moisture_Class",              "SOL properties",      "",                   "Moisture class: xeric, subxeric, submesic, mesic, mesic-subhygric, subhygric",
+  "Moisture_3",                  "SOL properties",      "",                   "Simplified moisture class: dry, moist, wet. Predictor in the SOL C combustion model",
+  "AgeClass",                    "SOL properties",      "",                   "Stand age class: Short (<30 yr), Mid (30-70 yr), Long (>70 yr)",
+  # --- SOL combustion ---
+  "SOL.C.Combusted_final",       "SOL combustion",      "g C m-2",            "SOL C combusted. Priority: field measured > modelled (burn depth, burn depth^2, moisture class) > residual accumulation rate x years combusted. See SOL.C.Combusted_source",
+  "SOL.C.Combusted_source",      "SOL combustion",      "",                   "Source of SOL.C.Combusted_final: field measured, modelled, profile years (accumulation rate), or missing",
+  # --- Radiocarbon ---
+  "F14C_TOP",                    "Radiocarbon",         "",                   "Fraction modern (F14C) of the surface radiocarbon sample. Used for pre-/post-bomb classification (F14C > 1) and calendar-year assignment",
+  "F14C_MID",                    "Radiocarbon",         "",                   "Fraction modern (F14C) of the middle radiocarbon sample",
+  "F14C_BOTTOM",                 "Radiocarbon",         "",                   "Fraction modern (F14C) of the basal radiocarbon sample",
+  "X14C_TOP",                    "Radiocarbon",         "per mille",          "Delta-14C of the surface radiocarbon sample as reported by the lab (reference year varies by lab). Used only for the weak-bomb surface threshold (<= +20 per mille)",
+  "X14C_MID",                    "Radiocarbon",         "per mille",          "Delta-14C of the middle radiocarbon sample as reported by the lab",
+  "X14C_BOTTOM",                 "Radiocarbon",         "per mille",          "Delta-14C of the basal radiocarbon sample as reported by the lab",
+  "calendar_year_median_TOP",    "Radiocarbon",         "calendar year CE",   "Assigned calendar year of the surface radiocarbon sample. Pre-bomb: Bchron posterior mode (IntCal20); post-bomb: read from Hua et al. 2021 NH Zone 1 on the assigned limb (see Methods). Column name retained from earlier versions; values are not medians",
+  "calendar_year_median_MID",    "Radiocarbon",         "calendar year CE",   "Assigned calendar year of the middle radiocarbon sample (as for calendar_year_median_TOP)",
+  "calendar_year_median_BOTTOM", "Radiocarbon",         "calendar year CE",   "Assigned calendar year of the basal radiocarbon sample (as for calendar_year_median_TOP)",
+  "depth_TOP",                   "Radiocarbon",         "cm",                 "Depth of the surface radiocarbon sample within the residual SOL profile",
+  "depth_MID",                   "Radiocarbon",         "cm",                 "Depth of the middle radiocarbon sample within the residual SOL profile",
+  "depth_BOTTOM",                "Radiocarbon",         "cm",                 "Depth of the basal radiocarbon sample within the residual SOL profile",
+  # --- C and N pools (measured) ---
+  "Npool.tot",                   "C pools",             "g N m-2",            "Total residual SOL N from the C/N profile (same depth as resid_total_C)",
+  "prefireSOL.C",                "C pools",             "g C m-2",            "Field-measured prefire SOL C (Walker and Walker/Mack sites only). Distinct from prefire_total_C, which is reconstructed for all sites",
+  # --- C pools: prefire ---
+  "prefire_legacy_C",            "C pools - prefire",   "g C m-2",            "Legacy C in prefire SOL = resid_legacy_C + comb_legacy_C",
+  "prefire_new_C",               "C pools - prefire",   "g C m-2",            "New C in prefire SOL = resid_new_C + comb_new_C",
+  "prefire_total_C",             "C pools - prefire",   "g C m-2",            "Total prefire SOL C = resid_total_C + SOL.C.Combusted_final",
+  "prefire_legacy_yr",           "C pools - prefire",   "yr",                 "Years of the prefire SOL that predate stand origin",
+  "prefire_new_yr",              "C pools - prefire",   "yr",                 "Years of the prefire SOL that postdate stand origin",
+  "prefire_total_yr",            "C pools - prefire",   "yr",                 "Total age span of the prefire SOL (Year_of_Burn - basal date)",
+  # --- C pools: residual ---
+  "resid_legacy_C",              "C pools - residual",  "g C m-2",            "Legacy C in residual SOL = resid_total_C x fraction of residual years predating stand origin",
+  "resid_new_C",                 "C pools - residual",  "g C m-2",            "New C in residual SOL = resid_total_C - resid_legacy_C",
+  "resid_total_C",               "C pools - residual",  "g C m-2",            "Total residual SOL C from the C/N profile, to total.depth.cn_trimmed. NA where all samples fall below the C% threshold",
+  "resid_legacy_yr",             "C pools - residual",  "yr",                 "Years of the residual SOL that predate stand origin",
+  "resid_new_yr",                "C pools - residual",  "yr",                 "Years of the residual SOL that postdate stand origin",
+  "resid_total_yr",              "C pools - residual",  "yr",                 "Total age span of the residual SOL (surface date - basal date)",
+  # --- C pools: combusted ---
+  "comb_legacy_C",               "C pools - combusted", "g C m-2",            "Legacy C combusted = SOL.C.Combusted_final x comb_legacy_yr / comb_total_yr",
+  "comb_new_C",                  "C pools - combusted", "g C m-2",            "New C combusted = SOL.C.Combusted_final - comb_legacy_C",
+  "comb_total_C",                "C pools - combusted", "g C m-2",            "Total SOL C combusted (= SOL.C.Combusted_final)",
+  "comb_legacy_yr",              "C pools - combusted", "yr",                 "Years of the combusted SOL layer that predate stand origin",
+  "comb_new_yr",                 "C pools - combusted", "yr",                 "Years of the combusted SOL layer that postdate stand origin",
+  "comb_total_yr",               "C pools - combusted", "yr",                 "Age span of the combusted SOL layer (Year_of_Burn - surface date)",
+  # --- Inclusion and quality flags ---
+  "exclusion_reason",            "Flags",               "",                   "Reason for exclusion from the analysis; NA = included. Values: insufficient_C_concentration, age_inversion, missing_residual_C, missing_RC_surface, missing_RC_basal, combustion_outlier, not_in_manuscript (archived for completeness; not analysed or reported)",
+  "included_in_analysis",        "Flags",               "",                   "TRUE if the profile meets all inclusion criteria. Filter on this column to reproduce the analysed dataset (n = 224)",
+  "age_inversion",               "Flags",               "",                   "TRUE if calendar_year_median_TOP < calendar_year_median_BOTTOM. Excluded unless inversion_retained is TRUE",
+  "inversion_retained",          "Flags",               "",                   "TRUE if age_inversion but all dated samples fall on one side of stand origin. Retained, with residual SOL entirely legacy C (inversion_all_legacy) or entirely new C; youngest date treated as the residual surface and oldest as the base; accumulation rates NA",
+  "inversion_all_legacy",        "Flags",               "",                   "TRUE if inversion_retained and all dated samples predate stand origin",
+  "mid_inversion",               "Flags",               "",                   "TRUE if MID is out of depth order with TOP or BOTTOM. Retained",
+  "rising_spread",               "Flags",               "",                   "TRUE if all samples contain bomb C on the rising limb and ages were spread by depth (surface = 1964, older with depth at the median surface accumulation rate, not before 1955)",
+  "top_from_mid",                "Flags",               "",                   "TRUE if the surface sample had a weak bomb signal (Delta-14C <= +20 per mille) over a pre-bomb sample within 4 cm and was assigned that sample's age",
+  "burn_depth_imputed",          "Flags",               "",                   "TRUE if burn_depth was not measured and was estimated as SOL.C.Combusted_final / C_density_mean_per_cm",
+  "LC_prefire",                  "Flags",               "",                   "TRUE if prefire_legacy_C > 0 (legacy C present in prefire SOL)",
+  "LC_resid",                    "Flags",               "",                   "TRUE if resid_legacy_C > 0 (legacy C present in residual SOL)",
+  "LC_combusted",                "Flags",               "",                   "TRUE if comb_legacy_yr > 0 (legacy C combusted)",
+  "LC_resid_bin",                "Flags",               "0/1",                "Integer version of LC_resid (model response)",
+  "LC_comb_bin",                 "Flags",               "0/1",                "Integer version of LC_combusted (model response)",
+  # --- Diagnostics ---
+  "C_accumulation_rate_residual","Diagnostics",         "g C m-2 yr-1",       "resid_total_C / resid_total_yr. Used to estimate SOL C combustion where burn depth was not measured (SOL.C.Combusted_source = profile years). NA for retained inversions",
+  "C_density_mean_per_cm",       "Diagnostics",         "g C m-2 cm-1",       "resid_total_C / total.depth.cn_trimmed. Used to estimate burn depth where it was not measured"
+)
+
+# Keep only entries for columns in the archive, and check every archive column is documented
+data_dictionary <- data_dictionary %>% filter(column %in% names(CN_archive))
+undocumented <- setdiff(names(CN_archive), data_dictionary$column)
+if (length(undocumented) > 0)
+  stop("Archive columns missing from the data dictionary: ", paste(undocumented, collapse = ", "))
+
+write_csv(data_dictionary, "LCC_LegacyCarbon_archive_data_dictionary.csv")
+cat("Data dictionary written:", nrow(data_dictionary), "columns documented\n")
+
+```
+
+---
+
+# 8  Methods numbers
+
+Run after the archive is built: uses objects from sections 4-7 (`cal_dat` from 6.5, `LC_prefire` from 6.12).
+
+```{r methods-numbers}
+# ── Radiocarbon measurement counts ────────────────────────────────────────
+cat("Individual radiocarbon measurements (raw, as loaded):", nrow(radio), "\n")
+cat("Individual radiocarbon measurements (after site join/QC):", nrow(rc_age), "\n")
+
+# unique cores represented by those measurements
+cat("Unique cores with >=1 radiocarbon measurement:",
+    n_distinct(radio$soilID), "\n")
+
+# ── Profile counts ─────────────────────────────────────────────────────────
+cat("Total profiles in archive (CN.all):", nrow(CN.all), "\n")
+cat("Included in analysis:", sum(CN.all$included_in_analysis, na.rm = TRUE), "\n")
+cat("Excluded:", sum(!CN.all$included_in_analysis, na.rm = TRUE), "\n\n")
+
+# exclusion breakdown - use this to replace/verify your inline "3 / 5 / 20 / 10 / 1" list
+CN.all %>% count(exclusion_reason, sort = TRUE) %>% print()
+
+# ── Downstream analysis subsets ─────────────────────────────────────────────
+# sites analyzed for total SOL C / prefire legacy C (should be all included profiles)
+cat("n for total SOL C / prefire legacy C models:",
+    sum(CN.all$included_in_analysis, na.rm = TRUE), "\n")
+
+# sites analyzed for combusted legacy C (restricted to prefire legacy C present)
+cat("n for combusted legacy C occurrence/pool/interval models:",
+    CN.all %>% filter(included_in_analysis, LC_prefire == TRUE) %>% nrow(), "\n")
+
+# ── SOL C combustion source breakdown (field measured / modelled / other) ──
+CN.all %>%
+  filter(included_in_analysis) %>%
+  count(SOL.C.Combusted_source, sort = TRUE) %>%
+  print()
+
+CN.all %>%
+ # filter(included_in_analysis) %>%
+  count(SOL.C.Combusted_source, sort = TRUE) %>%
+  print()
+
+
+# ── Calibration model (Supplementary Fig. 4) dataset size ──────────────────
+cat("Calibration dataset (field-measured, complete burn depth + moisture):",
+    nrow(cal_dat), "\n")
+cat("Samples requiring model-based SOL C combustion estimate:",
+    sum(CN.all$SOL.C.Combusted_source == "modelled" & CN.all$included_in_analysis, na.rm = TRUE), "\n")
+
+sum(radio %>% filter(Section_new %in% c("TOP","MID","BOTTOM")) %>% distinct(fire, site, plot, soilID, Section_new) %>% count(fire, site, plot, soilID) %>% pull(n) == 2)
+
+nrow(cn)  # total individual depth-wise CN subsamples measured
+cn %>% distinct(project, Researcher, StudyArea, fire, site, plot, siteplot) %>% nrow()  # total soil monoliths represented
+
+# How many rows failed pre/post-bomb classification entirely? (Step A)
+rc_classified %>% filter(is.na(carbon_era)) %>% nrow()
+rc_classified %>% filter(is.na(carbon_era)) %>%
+  select(fire, site, plot, soilID, Section_new, X14C)
+
+# rc_age row count right after combining prebomb/postbomb, BEFORE structural fixes
+nrow(bind_rows(prebomb, postbomb_1))
+
+# How many rows removed by the MID->BOTTOM relabeling fix specifically? (Step B)
+bind_rows(prebomb, postbomb_1) %>%
+  filter(soilID %in% RELABEL_MID_TO_BOTTOM, Section_new == "BOTTOM") %>%
+  nrow()
+
+# Grouping by soilID alone (the documented unique core ID)
+radio %>%
+  filter(Section_new %in% c("TOP","MID","BOTTOM")) %>%
+  distinct(soilID, Section_new) %>%
+  count(soilID) %>%
+  count(n)
+
+# Does soilID ever appear under more than one fire/site/plot combo?
+# If this returns any rows, that confirms the compound grouping was fragmenting real cores.
+radio %>% distinct(fire, site, plot, soilID) %>% count(soilID) %>% filter(n > 1)
+```

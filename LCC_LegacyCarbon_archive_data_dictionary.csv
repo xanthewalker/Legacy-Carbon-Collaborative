@@ -1,0 +1,92 @@
+column,group,units,description
+Researcher,Identification,,Research group (harmonized name)
+StudyArea,Identification,,"Circumpolar region: AK boreal, AK tundra, AK maritime, Yukon, NWT, Quebec, NL, Sweden"
+fire,Identification,,Fire event identifier (Walker and Walker/Mack only)
+site,Identification,,Site identifier
+plot,Identification,,Plot identifier within site
+project,Identification,,"Source project code (LC, LCC, NWT)"
+siteplot,Identification,,"Site-plot identifier used to join site, C/N and radiocarbon data"
+field_id,Identification,,Original field identifier assigned by the contributing researcher
+soilID,Identification,,Unique soil profile (radiocarbon core) identifier
+Year_of_Burn,Site,calendar year CE,Year of the most recent fire
+stand_age,Site,yr,Fire-free interval before the most recent fire. Imputed values are flagged in stand_age_imputed
+stand_age_imputed,Site,,"Imputation flag: imputed_100, imputed_250, or NA (measured)"
+age_method,Site,,Method used to determine stand age
+Latitude,Site,decimal degrees,Site latitude (north positive)
+Longitude,Site,decimal degrees,"Site longitude (east positive, west negative)"
+Slope,Site,degrees,Terrain slope
+Aspect,Site,degrees,Terrain aspect
+Elevation,Site,m a.s.l.,Site elevation
+MAT,Site,degrees C,Mean annual temperature (30-yr normal from spatial data). NA for Walker/Mack NWT
+MAP,Site,mm,Mean annual precipitation (30-yr normal from spatial data). NA for Walker/Mack NWT
+tree_cover,Site,%,Canopy tree cover from remote sensing. NA for Walker/Mack NWT
+ForestType,Vegetation,,Dominant tree/vegetation type as recorded in the field. Primary input to ForestGroup
+Eco_Type,Vegetation,,Broader vegetation description. Input to ForestGroup where ForestType is blank
+ForestGroup,Vegetation,,"Vegetation group derived from ForestType/Eco_Type: Black spruce, Other conifer, Deciduous/Mixed, Tundra / Non-forested"
+Eco,Vegetation,,"Ecosystem class (8 levels) from ForestGroup, StudyArea and BS_Position, with profile-level overrides from the site file"
+BS_Position,Vegetation,,Upland / Lowland for black spruce (and AK boreal other conifer): Lowland if prefire_depth >= 20 cm
+Dom_species,Vegetation,,Dominant tree species (Latin binomial)
+burn_depth,Fire / SOL,cm,Depth of SOL consumed by fire. Field-measured unless burn_depth_imputed is TRUE; recorded zeros set to 1 cm
+BurnDepth_Class,Fire / SOL,,"Burn depth class: Shallow (<5 cm), Moderate (5-10 cm), Deep (>10 cm)"
+Burn_depth_method,Fire / SOL,,Method used to measure burn depth (LCC sites only)
+residualSOL_depth,Fire / SOL,cm,Field-measured residual SOL depth after fire
+prefire_depth,Fire / SOL,cm,"Reconstructed prefire SOL depth = (depth_BOTTOM, else total.depth.cn_trimmed, else residualSOL_depth) + burn_depth"
+total.depth.cn_trimmed,Fire / SOL,cm,Depth of the residual C/N profile used for all C pool calculations; trimmed to depth_BOTTOM where the C/N profile extends >5 cm below the basal radiocarbon sample
+Thaw_depth,Fire / SOL,cm,Active layer / thaw depth at time of sampling
+mean_bd,SOL properties,g cm-3,Mean bulk density across the residual C/N profile
+mean_C_pct,SOL properties,%,Mean C concentration across the residual C/N profile
+mean_N_pct,SOL properties,%,Mean N concentration across the residual C/N profile
+profile_depth,SOL properties,cm,Total depth of the C/N profile (sum of sample depths)
+Moisture_Class,SOL properties,,"Moisture class: xeric, subxeric, submesic, mesic, mesic-subhygric, subhygric"
+Moisture_3,SOL properties,,"Simplified moisture class: dry, moist, wet. Predictor in the SOL C combustion model"
+AgeClass,SOL properties,,"Stand age class: Short (<30 yr), Mid (30-70 yr), Long (>70 yr)"
+SOL.C.Combusted_final,SOL combustion,g C m-2,"SOL C combusted. Priority: field measured > modelled (burn depth, burn depth^2, moisture class) > residual accumulation rate x years combusted. See SOL.C.Combusted_source"
+SOL.C.Combusted_source,SOL combustion,,"Source of SOL.C.Combusted_final: field measured, modelled, profile years (accumulation rate), or missing"
+F14C_TOP,Radiocarbon,,Fraction modern (F14C) of the surface radiocarbon sample. Used for pre-/post-bomb classification (F14C > 1) and calendar-year assignment
+F14C_MID,Radiocarbon,,Fraction modern (F14C) of the middle radiocarbon sample
+F14C_BOTTOM,Radiocarbon,,Fraction modern (F14C) of the basal radiocarbon sample
+X14C_TOP,Radiocarbon,per mille,Delta-14C of the surface radiocarbon sample as reported by the lab (reference year varies by lab). Used only for the weak-bomb surface threshold (<= +20 per mille)
+X14C_MID,Radiocarbon,per mille,Delta-14C of the middle radiocarbon sample as reported by the lab
+X14C_BOTTOM,Radiocarbon,per mille,Delta-14C of the basal radiocarbon sample as reported by the lab
+calendar_year_median_TOP,Radiocarbon,calendar year CE,Assigned calendar year of the surface radiocarbon sample. Pre-bomb: Bchron posterior mode (IntCal20); post-bomb: read from Hua et al. 2021 NH Zone 1 on the assigned limb (see Methods). Column name retained from earlier versions; values are not medians
+calendar_year_median_MID,Radiocarbon,calendar year CE,Assigned calendar year of the middle radiocarbon sample (as for calendar_year_median_TOP)
+calendar_year_median_BOTTOM,Radiocarbon,calendar year CE,Assigned calendar year of the basal radiocarbon sample (as for calendar_year_median_TOP)
+depth_TOP,Radiocarbon,cm,Depth of the surface radiocarbon sample within the residual SOL profile
+depth_MID,Radiocarbon,cm,Depth of the middle radiocarbon sample within the residual SOL profile
+depth_BOTTOM,Radiocarbon,cm,Depth of the basal radiocarbon sample within the residual SOL profile
+Npool.tot,C pools,g N m-2,Total residual SOL N from the C/N profile (same depth as resid_total_C)
+prefireSOL.C,C pools,g C m-2,"Field-measured prefire SOL C (Walker and Walker/Mack sites only). Distinct from prefire_total_C, which is reconstructed for all sites"
+prefire_legacy_C,C pools - prefire,g C m-2,Legacy C in prefire SOL = resid_legacy_C + comb_legacy_C
+prefire_new_C,C pools - prefire,g C m-2,New C in prefire SOL = resid_new_C + comb_new_C
+prefire_total_C,C pools - prefire,g C m-2,Total prefire SOL C = resid_total_C + SOL.C.Combusted_final
+prefire_legacy_yr,C pools - prefire,yr,Years of the prefire SOL that predate stand origin
+prefire_new_yr,C pools - prefire,yr,Years of the prefire SOL that postdate stand origin
+prefire_total_yr,C pools - prefire,yr,Total age span of the prefire SOL (Year_of_Burn - basal date)
+resid_legacy_C,C pools - residual,g C m-2,Legacy C in residual SOL = resid_total_C x fraction of residual years predating stand origin
+resid_new_C,C pools - residual,g C m-2,New C in residual SOL = resid_total_C - resid_legacy_C
+resid_total_C,C pools - residual,g C m-2,"Total residual SOL C from the C/N profile, to total.depth.cn_trimmed. NA where all samples fall below the C% threshold"
+resid_legacy_yr,C pools - residual,yr,Years of the residual SOL that predate stand origin
+resid_new_yr,C pools - residual,yr,Years of the residual SOL that postdate stand origin
+resid_total_yr,C pools - residual,yr,Total age span of the residual SOL (surface date - basal date)
+comb_legacy_C,C pools - combusted,g C m-2,Legacy C combusted = SOL.C.Combusted_final x comb_legacy_yr / comb_total_yr
+comb_new_C,C pools - combusted,g C m-2,New C combusted = SOL.C.Combusted_final - comb_legacy_C
+comb_total_C,C pools - combusted,g C m-2,Total SOL C combusted (= SOL.C.Combusted_final)
+comb_legacy_yr,C pools - combusted,yr,Years of the combusted SOL layer that predate stand origin
+comb_new_yr,C pools - combusted,yr,Years of the combusted SOL layer that postdate stand origin
+comb_total_yr,C pools - combusted,yr,Age span of the combusted SOL layer (Year_of_Burn - surface date)
+exclusion_reason,Flags,,"Reason for exclusion from the analysis; NA = included. Values: insufficient_C_concentration, age_inversion, missing_residual_C, missing_RC_surface, missing_RC_basal, combustion_outlier, not_in_manuscript (archived for completeness; not analysed or reported)"
+included_in_analysis,Flags,,TRUE if the profile meets all inclusion criteria. Filter on this column to reproduce the analysed dataset (n = 224)
+age_inversion,Flags,,TRUE if calendar_year_median_TOP < calendar_year_median_BOTTOM. Excluded unless inversion_retained is TRUE
+inversion_retained,Flags,,"TRUE if age_inversion but all dated samples fall on one side of stand origin. Retained, with residual SOL entirely legacy C (inversion_all_legacy) or entirely new C; youngest date treated as the residual surface and oldest as the base; accumulation rates NA"
+inversion_all_legacy,Flags,,TRUE if inversion_retained and all dated samples predate stand origin
+mid_inversion,Flags,,TRUE if MID is out of depth order with TOP or BOTTOM. Retained
+rising_spread,Flags,,"TRUE if all samples contain bomb C on the rising limb and ages were spread by depth (surface = 1964, older with depth at the median surface accumulation rate, not before 1955)"
+top_from_mid,Flags,,TRUE if the surface sample had a weak bomb signal (Delta-14C <= +20 per mille) over a pre-bomb sample within 4 cm and was assigned that sample's age
+burn_depth_imputed,Flags,,TRUE if burn_depth was not measured and was estimated as SOL.C.Combusted_final / C_density_mean_per_cm
+LC_prefire,Flags,,TRUE if prefire_legacy_C > 0 (legacy C present in prefire SOL)
+LC_resid,Flags,,TRUE if resid_legacy_C > 0 (legacy C present in residual SOL)
+LC_combusted,Flags,,TRUE if comb_legacy_yr > 0 (legacy C combusted)
+LC_resid_bin,Flags,0/1,Integer version of LC_resid (model response)
+LC_comb_bin,Flags,0/1,Integer version of LC_combusted (model response)
+C_accumulation_rate_residual,Diagnostics,g C m-2 yr-1,resid_total_C / resid_total_yr. Used to estimate SOL C combustion where burn depth was not measured (SOL.C.Combusted_source = profile years). NA for retained inversions
+C_density_mean_per_cm,Diagnostics,g C m-2 cm-1,resid_total_C / total.depth.cn_trimmed. Used to estimate burn depth where it was not measured
