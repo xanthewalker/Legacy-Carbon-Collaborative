@@ -44,7 +44,7 @@ This repository contains:
 
 ### `LCC_LegacyCarbon_archive.csv`
 
-- **258 soil profiles × 92 columns.** One row per radiocarbon-dated soil profile (`soilID`).
+- **258 soil profiles × 91 columns.** One row per radiocarbon-dated soil profile (`soilID`).
 - `included_in_analysis = TRUE` marks the [224] profiles used in the manuscript. The other profiles are kept for completeness, and `exclusion_reason` says why each was excluded.
 - Eight profiles contributed by Parisien from unburned stands, or from fires more than 20 years before sampling, are archived but not used in the manuscript.
 - Column groups:
